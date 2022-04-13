@@ -142,10 +142,7 @@ static bool virgl_egl_get_interface(struct egl_funcs *funcs)
 
    assert(funcs);
 
-   if (virgl_egl_has_extension_in_string(client_extensions, "EGL_KHR_platform_base")) {
-      funcs->eglGetPlatformDisplay =
-         (PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress ("eglGetPlatformDisplay");
-   } else if (virgl_egl_has_extension_in_string(client_extensions, "EGL_EXT_platform_base")) {
+   if (virgl_egl_has_extension_in_string(client_extensions, "EGL_EXT_platform_base")) {
       funcs->eglGetPlatformDisplay =
          (PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress ("eglGetPlatformDisplayEXT");
    }
@@ -321,20 +318,7 @@ struct virgl_egl *virgl_egl_init(struct virgl_gbm *gbm, bool surfaceless, bool g
      /* Make -Wdangling-else happy. */
    } else /* Fallback to surfaceless. */
 #endif
-   if (virgl_egl_has_extension_in_string(client_extensions, "EGL_KHR_platform_base")) {
-      PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
-         (PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress ("eglGetPlatformDisplay");
-
-      if (!get_platform_display)
-        goto fail;
-
-      if (surfaceless) {
-         egl->egl_display = get_platform_display (EGL_PLATFORM_SURFACELESS_MESA,
-                                                  EGL_DEFAULT_DISPLAY, NULL);
-      } else
-         egl->egl_display = get_platform_display (EGL_PLATFORM_GBM_KHR,
-                                                  (EGLNativeDisplayType)egl->gbm->device, NULL);
-   } else if (virgl_egl_has_extension_in_string(client_extensions, "EGL_EXT_platform_base")) {
+   if (virgl_egl_has_extension_in_string(client_extensions, "EGL_EXT_platform_base")) {
       PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
          (PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress ("eglGetPlatformDisplayEXT");
 
@@ -433,6 +417,34 @@ void virgl_egl_destroy(struct virgl_egl *egl)
    free(egl);
 }
 
+struct virgl_egl *virgl_egl_init_external(EGLDisplay egl_display)
+{
+   const char *extensions;
+   struct virgl_egl *egl;
+
+   egl = calloc(1, sizeof(struct virgl_egl));
+   if (!egl)
+      return NULL;
+
+   egl->egl_display = egl_display;
+
+   extensions = eglQueryString(egl->egl_display, EGL_EXTENSIONS);
+#ifdef VIRGL_EGL_DEBUG
+   vrend_printf( "EGL version: %s\n",
+           eglQueryString(egl->egl_display, EGL_VERSION));
+   vrend_printf( "EGL vendor: %s\n",
+           eglQueryString(egl->egl_display, EGL_VENDOR));
+   vrend_printf( "EGL extensions: %s\n", extensions);
+#endif
+
+   if (virgl_egl_init_extensions(egl, extensions)) {
+      free(egl);
+      return NULL;
+   }
+
+   return egl;
+}
+
 virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct virgl_gl_ctx_param *vparams)
 {
    EGLContext egl_ctx;
@@ -482,7 +494,7 @@ int virgl_egl_get_fourcc_for_texture(struct virgl_egl *egl, uint32_t tex_id, uin
    }
 
    image = eglCreateImageKHR(egl->egl_display, eglGetCurrentContext(), EGL_GL_TEXTURE_2D_KHR,
-                            (EGLClientBuffer)(unsigned long)tex_id, NULL);
+                            (EGLClientBuffer)(uintptr_t)tex_id, NULL);
 
    if (!image)
       return EINVAL;
@@ -507,7 +519,7 @@ int virgl_egl_get_fd_for_texture2(struct virgl_egl *egl, uint32_t tex_id, int *f
    int ret = EINVAL;
    EGLImageKHR image = eglCreateImageKHR(egl->egl_display, eglGetCurrentContext(),
                                          EGL_GL_TEXTURE_2D_KHR,
-                                         (EGLClientBuffer)(unsigned long)tex_id, NULL);
+                                         (EGLClientBuffer)(uintptr_t)tex_id, NULL);
    if (!image)
       return EINVAL;
    if (!has_bit(egl->extension_bits, EGL_MESA_IMAGE_DMA_BUF_EXPORT))
@@ -532,7 +544,7 @@ int virgl_egl_get_fd_for_texture(struct virgl_egl *egl, uint32_t tex_id, int *fd
    EGLBoolean success;
    int ret;
    image = eglCreateImageKHR(egl->egl_display, eglGetCurrentContext(), EGL_GL_TEXTURE_2D_KHR,
-                            (EGLClientBuffer)(unsigned long)tex_id, NULL);
+                            (EGLClientBuffer)(uintptr_t)tex_id, NULL);
 
    if (!image)
       return EINVAL;

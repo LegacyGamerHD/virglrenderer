@@ -21,6 +21,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 #
 
+subdir('mesa')
 subdir('gallium')
 
 virgl_sources = [
@@ -76,15 +77,72 @@ vrend_winsys_glx_sources = [
 ]
 
 venus_sources = [
-   'venus-protocol/vn_protocol_renderer.h',
    'venus_hw.h',
-   'vkr_cs.c',
-   'vkr_cs.h',
-   'vkr_object.h',
-   'vkr_renderer.c',
-   'vkr_renderer.h',
-   'vkr_ring.c',
-   'vkr_ring.h',
+   'venus/venus-protocol/vn_protocol_renderer.h',
+   'venus/vkr_allocator.c',
+   'venus/vkr_allocator.h',
+   'venus/vkr_buffer.c',
+   'venus/vkr_buffer.h',
+   'venus/vkr_command_buffer.c',
+   'venus/vkr_command_buffer.h',
+   'venus/vkr_common.c',
+   'venus/vkr_common.h',
+   'venus/vkr_context.c',
+   'venus/vkr_context.h',
+   'venus/vkr_cs.c',
+   'venus/vkr_cs.h',
+   'venus/vkr_descriptor_set.c',
+   'venus/vkr_descriptor_set.h',
+   'venus/vkr_device.c',
+   'venus/vkr_device.h',
+   'venus/vkr_device_memory.c',
+   'venus/vkr_device_memory.h',
+   'venus/vkr_image.c',
+   'venus/vkr_image.h',
+   'venus/vkr_instance.c',
+   'venus/vkr_instance.h',
+   'venus/vkr_physical_device.c',
+   'venus/vkr_physical_device.h',
+   'venus/vkr_pipeline.c',
+   'venus/vkr_pipeline.h',
+   'venus/vkr_query_pool.c',
+   'venus/vkr_query_pool.h',
+   'venus/vkr_queue.c',
+   'venus/vkr_queue.h',
+   'venus/vkr_render_pass.c',
+   'venus/vkr_render_pass.h',
+   'venus/vkr_renderer.c',
+   'venus/vkr_renderer.h',
+   'venus/vkr_ring.c',
+   'venus/vkr_ring.h',
+   'venus/vkr_transport.c',
+   'venus/vkr_transport.h',
+]
+
+venus_codegen = custom_target(
+   'venus_codegen',
+   input : ['venus/vkr_device_object.py', 'venus/vkr_device_object.json'],
+   output : [
+      'vkr_buffer_gen.h',
+      'vkr_command_buffer_gen.h',
+      'vkr_descriptor_set_gen.h',
+      'vkr_device_memory_gen.h',
+      'vkr_image_gen.h',
+      'vkr_pipeline_gen.h',
+      'vkr_query_pool_gen.h',
+      'vkr_queue_gen.h',
+      'vkr_render_pass_gen.h',
+   ],
+   command : [prog_python, '@INPUT0@', '-o', '@OUTDIR@', '@INPUT1@'],
+)
+
+proxy_sources = [
+   'proxy/proxy_client.c',
+   'proxy/proxy_common.c',
+   'proxy/proxy_context.c',
+   'proxy/proxy_renderer.c',
+   'proxy/proxy_server.c',
+   'proxy/proxy_socket.c',
 ]
 
 virgl_depends = [
@@ -117,20 +175,25 @@ endif
 
 if with_venus
    virgl_sources += venus_sources
+   virgl_sources += venus_codegen
    virgl_depends += [venus_dep]
+endif
+
+if with_render_server
+   virgl_sources += proxy_sources
 endif
 
 libvirgl = static_library(
    'virgl',
    virgl_sources,
-   include_directories: [inc_gallium, inc_configuration],
+   include_directories: [inc_gallium, inc_configuration, 'venus'],
    dependencies : virgl_depends,
 )
 
 libvirgl_inc = [
    inc_gallium,
    inc_configuration,
-   include_directories('.')
+   include_directories(['.', 'venus'])
 ]
 
 libvirgl_dep = declare_dependency(

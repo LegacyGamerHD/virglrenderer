@@ -53,6 +53,7 @@
 #include "util/u_double_list.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_pointer.h"
 #include "util/u_hash_table.h"
 
 #define VTEST_MAX_SYNC_QUEUE_COUNT 64
@@ -1191,7 +1192,7 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
       return report_failed_call("virgl_renderer_resource_create_blob", ret);
    }
 
-   /* need dmabuf */
+   /* export blob */
    if (args.blob_mem == VIRGL_RENDERER_BLOB_MEM_HOST3D) {
       uint32_t fd_type;
       ret = virgl_renderer_resource_export_blob(res->res_id, &fd_type, &fd);
@@ -1199,7 +1200,8 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
          vtest_unref_resource(res);
          return report_failed_call("virgl_renderer_resource_export_blob", ret);
       }
-      if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF) {
+      if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF &&
+          fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
          close(fd);
          vtest_unref_resource(res);
          return report_failed_call("virgl_renderer_resource_export_blob", -EINVAL);

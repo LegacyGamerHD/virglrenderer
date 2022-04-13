@@ -86,33 +86,6 @@ enum vec_type {
    VEC_UINT = 2
 };
 
-struct vrend_shader_io {
-   unsigned                name;
-   unsigned                gpr;
-   unsigned                done;
-   int                        sid;
-   unsigned                interpolate;
-   int first;
-   int last;
-   int array_id;
-   uint8_t usage_mask;
-   int swizzle_offset;
-   int num_components;
-   int layout_location;
-   unsigned                location;
-   bool                    invariant;
-   bool                    precise;
-   bool glsl_predefined_no_emit;
-   bool glsl_no_index;
-   bool glsl_gl_block;
-   bool override_no_wm;
-   bool is_int;
-   enum vec_type type;
-   bool fbfetch_used;
-   char glsl_name[128];
-   unsigned stream;
-};
-
 struct vrend_shader_sampler {
    int tgsi_sampler_type;
    enum tgsi_return_type tgsi_sampler_return;
@@ -145,6 +118,34 @@ struct vrend_temp_range {
    int array_id;
 };
 
+struct vrend_shader_io {
+   char glsl_name[128];
+   struct vrend_shader_io *overlapping_array;
+   unsigned sid : 16;
+   unsigned first : 16;
+   unsigned last : 16;
+   unsigned array_id : 10;
+   unsigned interpolate : 4;
+   unsigned location : 2;
+
+   unsigned array_offset : 8;
+   unsigned name : 8;
+   unsigned stream : 2;
+   unsigned usage_mask : 4;
+   unsigned type : 2;
+   unsigned num_components : 3;
+
+   unsigned layout_location : 1;
+   unsigned invariant : 1;
+   unsigned precise : 1;
+   unsigned glsl_predefined_no_emit : 1;
+   unsigned glsl_no_index : 1;
+   unsigned glsl_gl_block : 1;
+   unsigned override_no_wm : 1;
+   unsigned is_int : 1;
+   unsigned fbfetch_used : 1;
+};
+
 struct vrend_io_range {
    struct vrend_shader_io io;
    bool used;
@@ -161,9 +162,9 @@ struct vrend_generic_ios {
    struct vrend_io_range input_range;
    struct vrend_io_range output_range;
 
-   uint32_t outputs_expected_mask;
-   uint32_t inputs_emitted_mask;
-   uint32_t outputs_emitted_mask;
+   uint64_t outputs_expected_mask;
+   uint64_t inputs_emitted_mask;
+   uint64_t outputs_emitted_mask;
 };
 
 struct vrend_patch_ios {
@@ -181,6 +182,7 @@ struct dump_ctx {
    uint instno;
 
    struct vrend_strbuf src_bufs[4];
+   struct vrend_strbuf dst_bufs[3];
 
    uint32_t num_interps;
    uint32_t num_inputs;
@@ -218,6 +220,9 @@ struct dump_ctx {
    struct vrend_array *sampler_arrays;
    uint32_t num_sampler_arrays;
 
+   uint32_t fog_input_mask;
+   uint32_t fog_output_mask;
+
    int num_consts;
    int num_imm;
    struct immed imm[MAX_IMMEDIATE];
@@ -253,10 +258,12 @@ struct dump_ctx {
 
    const struct vrend_shader_key *key;
    int num_in_clip_dist;
-   int num_clip_dist;
+   int num_out_clip_dist;
    int fs_uses_clipdist_input;
+   bool fs_has_color_outputs;
    int glsl_ver_required;
    int color_in_mask;
+   int color_out_mask;
    /* only used when cull is enabled */
    uint8_t num_cull_dist_prop, num_clip_dist_prop;
    bool has_pervertex;
@@ -271,12 +278,16 @@ struct dump_ctx {
    bool has_file_memory;
    bool force_color_two_side;
    bool winsys_adjust_y_emitted;
+   bool gles_use_tex_query_level;
+   bool has_pointsize_input;
+   bool has_pointsize_output;
 
    int tcs_vertices_out;
    int tes_prim_mode;
    int tes_spacing;
    int tes_vertex_order;
    int tes_point_mode;
+   bool is_last_vertex_stage;
 
    uint16_t local_cs_block_size[3];
 };
@@ -376,6 +387,25 @@ enum io_type {
    io_out
 };
 
+enum io_decl_type {
+   decl_plain,
+   decl_block
+};
+
+static
+void vrend_shader_write_io_as_src(struct vrend_strbuf *buf,
+                                  const  char *arrayname,
+                                  const struct vrend_shader_io *io,
+                                  const struct tgsi_full_src_register *src,
+                                  enum io_decl_type decl_type);
+
+static
+void vrend_shader_write_io_as_dst(struct vrend_strbuf *buf,
+                                  const  char *arrayname,
+                                  const struct vrend_shader_io *io,
+                                  const struct tgsi_full_dst_register *src,
+                                  enum io_decl_type decl_type);
+
 /* We prefer arrays of arrays, but if this is not available then TCS, GEOM, and TES
  * inputs must be blocks, but FS input should not because interpolateAt* doesn't
  * support dereferencing block members. */
@@ -432,6 +462,21 @@ static inline const char *get_wm_string(unsigned wm)
       return ".w";
    default:
       printf("Unable to unknown writemask\n");
+      return "";
+   }
+}
+
+static inline const char *get_swizzle_string(uint8_t swizzle)
+{
+   switch (swizzle) {
+   case PIPE_SWIZZLE_RED: return ".x";
+   case PIPE_SWIZZLE_GREEN: return ".y";
+   case PIPE_SWIZZLE_BLUE: return ".z";
+   case PIPE_SWIZZLE_ALPHA: return ".w";
+   case PIPE_SWIZZLE_ZERO: 
+   case PIPE_SWIZZLE_ONE: return ".0";
+   default:
+      assert(0);
       return "";
    }
 }
@@ -533,7 +578,7 @@ static inline bool fs_emit_layout(const struct dump_ctx *ctx)
       if coord_origin is 0 and invert is 1 - emit nothing (lower)
       if coord origin is 1 and invert is 0 - emit nothing (lower)
       if coord_origin is 1 and invert is 1 - emit origin upper left */
-   if (!(ctx->fs_coord_origin ^ ctx->key->invert_fs_origin))
+   if (!(ctx->fs_coord_origin ^ ctx->key->fs.invert_origin))
       return true;
    return false;
 }
@@ -878,6 +923,141 @@ static bool add_samplers(struct dump_ctx *ctx, int first, int last, int sview_ty
    return true;
 }
 
+typedef enum
+{
+   VARYING_SLOT_POS,
+   VARYING_SLOT_COL0, /* COL0 and COL1 must be contiguous */
+   VARYING_SLOT_COL1,
+   VARYING_SLOT_FOGC,
+   VARYING_SLOT_TEX0, /* TEX0-TEX7 must be contiguous */
+   VARYING_SLOT_TEX1,
+   VARYING_SLOT_TEX2,
+   VARYING_SLOT_TEX3,
+   VARYING_SLOT_TEX4,
+   VARYING_SLOT_TEX5,
+   VARYING_SLOT_TEX6,
+   VARYING_SLOT_TEX7,
+   VARYING_SLOT_PSIZ, /* Does not appear in FS */
+   VARYING_SLOT_BFC0, /* Does not appear in FS */
+   VARYING_SLOT_BFC1, /* Does not appear in FS */
+   VARYING_SLOT_EDGE, /* Does not appear in FS */
+   VARYING_SLOT_CLIP_VERTEX, /* Does not appear in FS */
+   VARYING_SLOT_CLIP_DIST0,
+   VARYING_SLOT_CLIP_DIST1,
+   VARYING_SLOT_CULL_DIST0,
+   VARYING_SLOT_CULL_DIST1,
+   VARYING_SLOT_PRIMITIVE_ID, /* Does not appear in VS */
+   VARYING_SLOT_LAYER, /* Appears as VS or GS output */
+   VARYING_SLOT_VIEWPORT, /* Appears as VS or GS output */
+   VARYING_SLOT_FACE, /* FS only */
+   VARYING_SLOT_PNTC, /* FS only */
+   VARYING_SLOT_TESS_LEVEL_OUTER, /* Only appears as TCS output. */
+   VARYING_SLOT_TESS_LEVEL_INNER, /* Only appears as TCS output. */
+   VARYING_SLOT_BOUNDING_BOX0, /* Only appears as TCS output. */
+   VARYING_SLOT_BOUNDING_BOX1, /* Only appears as TCS output. */
+   VARYING_SLOT_VIEW_INDEX,
+   VARYING_SLOT_VIEWPORT_MASK, /* Does not appear in FS */
+   VARYING_SLOT_PRIMITIVE_SHADING_RATE = VARYING_SLOT_FACE, /* Does not appear in FS. */
+
+   VARYING_SLOT_PRIMITIVE_COUNT = VARYING_SLOT_TESS_LEVEL_OUTER, /* Only appears in MESH. */
+   VARYING_SLOT_PRIMITIVE_INDICES = VARYING_SLOT_TESS_LEVEL_INNER, /* Only appears in MESH. */
+   VARYING_SLOT_TASK_COUNT = VARYING_SLOT_BOUNDING_BOX0, /* Only appears in TASK. */
+
+   VARYING_SLOT_VAR0 = 32, /* First generic varying slot */
+   /* the remaining are simply for the benefit of gl_varying_slot_name()
+    * and not to be construed as an upper bound:
+    */
+   VARYING_SLOT_VAR1,
+   VARYING_SLOT_VAR2,
+   VARYING_SLOT_VAR3,
+   VARYING_SLOT_VAR4,
+   VARYING_SLOT_VAR5,
+   VARYING_SLOT_VAR6,
+   VARYING_SLOT_VAR7,
+   VARYING_SLOT_VAR8,
+   VARYING_SLOT_VAR9,
+   VARYING_SLOT_VAR10,
+   VARYING_SLOT_VAR11,
+   VARYING_SLOT_VAR12,
+   VARYING_SLOT_VAR13,
+   VARYING_SLOT_VAR14,
+   VARYING_SLOT_VAR15,
+   VARYING_SLOT_VAR16,
+   VARYING_SLOT_VAR17,
+   VARYING_SLOT_VAR18,
+   VARYING_SLOT_VAR19,
+   VARYING_SLOT_VAR20,
+   VARYING_SLOT_VAR21,
+   VARYING_SLOT_VAR22,
+   VARYING_SLOT_VAR23,
+   VARYING_SLOT_VAR24,
+   VARYING_SLOT_VAR25,
+   VARYING_SLOT_VAR26,
+   VARYING_SLOT_VAR27,
+   VARYING_SLOT_VAR28,
+   VARYING_SLOT_VAR29,
+   VARYING_SLOT_VAR30,
+   VARYING_SLOT_VAR31,
+   /* Account for the shift without CAP_TEXCOORD in mesa*/
+   VARYING_SLOT_PATCH0 = VARYING_SLOT_VAR31 + 9
+} gl_varying_slot;
+
+static uint32_t
+varying_bit_from_semantic_and_index(int semantic, int index)
+{
+   switch (semantic) {
+   case TGSI_SEMANTIC_POSITION:
+      return VARYING_SLOT_POS;
+   case TGSI_SEMANTIC_COLOR:
+      if (index == 0)
+         return VARYING_SLOT_COL0;
+      else
+         return VARYING_SLOT_COL1;
+   case TGSI_SEMANTIC_BCOLOR:
+      if (index == 0)
+         return VARYING_SLOT_BFC0;
+      else
+         return VARYING_SLOT_BFC1;
+   case TGSI_SEMANTIC_FOG:
+      return VARYING_SLOT_FOGC;
+   case TGSI_SEMANTIC_PSIZE:
+      return VARYING_SLOT_PSIZ;
+   case TGSI_SEMANTIC_GENERIC:
+      return VARYING_SLOT_VAR0 + index;
+   case TGSI_SEMANTIC_FACE:
+      return VARYING_SLOT_FACE;
+   case TGSI_SEMANTIC_EDGEFLAG:
+      return VARYING_SLOT_EDGE;
+   case TGSI_SEMANTIC_PRIMID:
+      return VARYING_SLOT_PRIMITIVE_ID;
+   case TGSI_SEMANTIC_CLIPDIST:
+      if (index == 0)
+         return VARYING_SLOT_CLIP_DIST0;
+      else
+         return VARYING_SLOT_CLIP_DIST1;
+   case TGSI_SEMANTIC_CLIPVERTEX:
+      return VARYING_SLOT_CLIP_VERTEX;
+   case TGSI_SEMANTIC_TEXCOORD:
+      assert(index < 8);
+      return (VARYING_SLOT_TEX0 + index);
+   case TGSI_SEMANTIC_PCOORD:
+      return VARYING_SLOT_PNTC;
+   case TGSI_SEMANTIC_VIEWPORT_INDEX:
+      return VARYING_SLOT_VIEWPORT;
+   case TGSI_SEMANTIC_LAYER:
+      return VARYING_SLOT_LAYER;
+   case TGSI_SEMANTIC_TESSINNER:
+      return VARYING_SLOT_TESS_LEVEL_INNER;
+   case TGSI_SEMANTIC_TESSOUTER:
+      return VARYING_SLOT_TESS_LEVEL_OUTER;
+   case TGSI_SEMANTIC_PATCH:
+      return VARYING_SLOT_PATCH0 + index;
+   default:
+      vrend_printf("Warning: Bad TGSI semantic: %d/%d\n", semantic, index);
+      return 0;
+   }
+}
+
 static struct vrend_array *lookup_image_array_ptr(const struct dump_ctx *ctx, int index)
 {
    uint32_t i;
@@ -897,32 +1077,49 @@ static int lookup_image_array(const struct dump_ctx *ctx, int index)
 }
 
 static boolean
-iter_inputs(struct tgsi_iterate_context *iter,
-            struct tgsi_full_declaration *decl)
+iter_decls(struct tgsi_iterate_context *iter,
+           struct tgsi_full_declaration *decl)
 {
    struct dump_ctx *ctx = (struct dump_ctx *)iter;
    switch (decl->Declaration.File) {
    case TGSI_FILE_INPUT:
-      for (uint32_t j = 0; j < ctx->num_inputs; j++) {
-         if (ctx->inputs[j].name == decl->Semantic.Name &&
-             ctx->inputs[j].sid == decl->Semantic.Index &&
-             ctx->inputs[j].first == decl->Range.First)
-            return true;
+      /* Tag used semantic fog inputs */
+      if (decl->Semantic.Name == TGSI_SEMANTIC_FOG) {
+         ctx->fog_input_mask |= (1 << decl->Semantic.Index);
       }
-      ctx->inputs[ctx->num_inputs].name = decl->Semantic.Name;
-      ctx->inputs[ctx->num_inputs].first = decl->Range.First;
-      ctx->inputs[ctx->num_inputs].last = decl->Range.Last;
-      ctx->num_inputs++;
+
+      if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT) {
+         for (uint32_t j = 0; j < ctx->num_inputs; j++) {
+            if (ctx->inputs[j].name == decl->Semantic.Name &&
+                ctx->inputs[j].sid == decl->Semantic.Index &&
+                ctx->inputs[j].first == decl->Range.First)
+                  return true;
+         }
+         ctx->inputs[ctx->num_inputs].name = decl->Semantic.Name;
+         ctx->inputs[ctx->num_inputs].first = decl->Range.First;
+         ctx->inputs[ctx->num_inputs].last = decl->Range.Last;
+         ctx->num_inputs++;
+      }
+      break;
+
+   case TGSI_FILE_OUTPUT:
+      if (decl->Semantic.Name == TGSI_SEMANTIC_FOG) {
+         ctx->fog_output_mask |= (1 << decl->Semantic.Index);
+      }
+      break;
+
+   default:
+      break;
    }
    return true;
 }
 
 static bool logiop_require_inout(const struct vrend_shader_key *key)
 {
-   if (!key->fs_logicop_enabled)
+   if (!key->fs.logicop_enabled)
       return false;
 
-   switch (key->fs_logicop_func) {
+   switch (key->fs.logicop_func) {
    case PIPE_LOGICOP_CLEAR:
    case PIPE_LOGICOP_SET:
    case PIPE_LOGICOP_COPY:
@@ -945,6 +1142,47 @@ static enum vec_type get_type(uint32_t signed_int_mask,
       return VEC_FLOAT;
 }
 
+static struct vrend_shader_io *
+find_overlapping_io(struct vrend_shader_io io[static 64],
+                    uint32_t num_io,
+                    const struct tgsi_full_declaration *decl)
+{
+   for (uint32_t j = 0; j < num_io - 1; j++) {
+      if (io[j].interpolate == decl->Interp.Interpolate &&
+          io[j].name == decl->Semantic.Name &&
+          ((io[j].first <= decl->Range.First &&
+            io[j].last > decl->Range.First) ||
+           (io[j].first < decl->Range.Last &&
+            io[j].last >= decl->Range.Last))) {
+         return &io[j];
+      }
+   }
+   return NULL;
+}
+
+static void
+map_overlapping_io_array(struct vrend_shader_io io[static 64],
+                         struct vrend_shader_io *new_io,
+                         uint32_t num_io,
+                         const struct tgsi_full_declaration *decl)
+{
+   struct vrend_shader_io *overlap_io = find_overlapping_io(io, num_io, decl);
+   if (overlap_io) {
+      int delta = new_io->first - overlap_io->first;
+      if (delta >= 0) {
+         new_io->array_offset = delta;
+         new_io->overlapping_array = overlap_io;
+         overlap_io->last = MAX2(overlap_io->last, new_io->last);
+      } else if (delta < 0) {
+         overlap_io->overlapping_array = new_io;
+         overlap_io->array_offset = -delta;
+         new_io->last = MAX2(overlap_io->last, new_io->last);
+      }
+      overlap_io->usage_mask |= new_io->usage_mask;
+      new_io->usage_mask = overlap_io->usage_mask;
+   }
+}
+
 static boolean
 iter_declaration(struct tgsi_iterate_context *iter,
                  struct tgsi_full_declaration *decl)
@@ -952,9 +1190,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
    struct dump_ctx *ctx = (struct dump_ctx *)iter;
    int i;
    int color_offset = 0;
-   const char *name_prefix = "";
+   const char *name_prefix;
    bool add_two_side = false;
-   unsigned mask_temp;
 
    switch (decl->Declaration.File) {
    case TGSI_FILE_INPUT:
@@ -974,8 +1211,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
       }
       if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX) {
          ctx->attrib_input_mask |= (1 << decl->Range.First);
-         ctx->inputs[i].type = get_type(ctx->key->attrib_signed_int_bitmask,
-                                        ctx->key->attrib_unsigned_int_bitmask,
+         ctx->inputs[i].type = get_type(ctx->key->vs.attrib_signed_int_bitmask,
+                                        ctx->key->vs.attrib_unsigned_int_bitmask,
                                         decl->Range.First);
       }
       ctx->inputs[i].name = decl->Semantic.Name;
@@ -986,13 +1223,14 @@ iter_declaration(struct tgsi_iterate_context *iter,
       ctx->inputs[i].layout_location = 0;
       ctx->inputs[i].last = decl->Range.Last;
       ctx->inputs[i].array_id = decl->Declaration.Array ? decl->Array.ArrayID : 0;
-      ctx->inputs[i].usage_mask  = mask_temp = decl->Declaration.UsageMask;
-      u_bit_scan_consecutive_range(&mask_temp, &ctx->inputs[i].swizzle_offset, &ctx->inputs[i].num_components);
+      ctx->inputs[i].usage_mask = decl->Declaration.UsageMask;
+      ctx->inputs[i].num_components = 4;
 
       ctx->inputs[i].glsl_predefined_no_emit = false;
       ctx->inputs[i].glsl_no_index = false;
       ctx->inputs[i].override_no_wm = ctx->inputs[i].num_components == 1;
       ctx->inputs[i].glsl_gl_block = false;
+      ctx->inputs[i].overlapping_array = NULL;
 
       if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT &&
           decl->Interp.Location == TGSI_INTERPOLATE_LOC_SAMPLE) {
@@ -1000,8 +1238,12 @@ iter_declaration(struct tgsi_iterate_context *iter,
          ctx->has_sample_input = true;
       }
 
+      map_overlapping_io_array(ctx->inputs, &ctx->inputs[i], ctx->num_inputs, decl);
+
       if (ctx->inputs[i].first != ctx->inputs[i].last)
          ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
+
+      name_prefix = get_stage_input_name_prefix(ctx, iter->processor.Processor);
 
       switch (ctx->inputs[i].name) {
       case TGSI_SEMANTIC_COLOR:
@@ -1052,11 +1294,9 @@ iter_declaration(struct tgsi_iterate_context *iter,
                   }
                   add_two_side = true;
                }
-               name_prefix = "ex";
             }
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_PRIMID:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY) {
             name_prefix = "gl_PrimitiveIDIn";
@@ -1064,41 +1304,39 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->inputs[i].glsl_no_index = true;
             ctx->inputs[i].override_no_wm = true;
             ctx->shader_req_bits |= SHADER_REQ_INTS;
-            break;
          } else if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             name_prefix = "gl_PrimitiveID";
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
             ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
             ctx->shader_req_bits |= SHADER_REQ_GEOMETRY_SHADER;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_VIEWPORT_INDEX:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
             ctx->inputs[i].is_int = true;
+            ctx->inputs[i].type = VEC_INT;
             ctx->inputs[i].override_no_wm = true;
             name_prefix = "gl_ViewportIndex";
             if (ctx->glsl_ver_required >= 140)
                ctx->shader_req_bits |= SHADER_REQ_LAYER;
             if (ctx->cfg->use_gles)
                ctx->shader_req_bits |= SHADER_REQ_VIEWPORT_IDX;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_LAYER:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             name_prefix = "gl_Layer";
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
             ctx->inputs[i].is_int = true;
+            ctx->inputs[i].type = VEC_INT;
             ctx->inputs[i].override_no_wm = true;
             ctx->shader_req_bits |= SHADER_REQ_LAYER;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_PSIZE:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
              iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL ||
@@ -1109,9 +1347,9 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->inputs[i].override_no_wm = true;
             ctx->inputs[i].glsl_gl_block = true;
             ctx->shader_req_bits |= SHADER_REQ_PSIZE;
-            break;
+            ctx->has_pointsize_input = true;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_CLIPDIST:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
              iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL ||
@@ -1124,7 +1362,6 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->shader_req_bits |= SHADER_REQ_CLIP_DISTANCE;
             if (ctx->inputs[i].last != ctx->inputs[i].first)
                ctx->guest_sent_io_arrays = true;
-            break;
          } else if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             name_prefix = "gl_ClipDistance";
             ctx->inputs[i].glsl_predefined_no_emit = true;
@@ -1133,9 +1370,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->shader_req_bits |= SHADER_REQ_CLIP_DISTANCE;
             if (ctx->inputs[i].last != ctx->inputs[i].first)
                ctx->guest_sent_io_arrays = true;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_POSITION:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
              iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL ||
@@ -1144,7 +1380,6 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
             ctx->inputs[i].glsl_gl_block = true;
-            break;
          } else if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             if (ctx->cfg->use_gles && ctx->fs_pixel_center) {
                name_prefix = "(gl_FragCoord - vec4(0.5, 0.5, 0.0, 0.0))";
@@ -1152,9 +1387,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
                name_prefix = "gl_FragCoord";
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_FACE:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
             if (ctx->front_face_emitted) {
@@ -1165,13 +1399,25 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->inputs[i].glsl_predefined_no_emit = true;
             ctx->inputs[i].glsl_no_index = true;
             ctx->front_face_emitted = true;
-            break;
          }
-         /* fallthrough */
+         break;
+      case TGSI_SEMANTIC_PCOORD:
+         if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
+            if (ctx->cfg->use_gles)
+               name_prefix = "vec4(gl_PointCoord.x, mix(1.0 - gl_PointCoord.y, gl_PointCoord.y, clamp(winsys_adjust_y, 0.0, 1.0)), 0.0, 1.0)";
+            else
+               name_prefix = "vec4(gl_PointCoord, 0.0, 1.0)";
+            ctx->inputs[i].glsl_predefined_no_emit = true;
+            ctx->inputs[i].glsl_no_index = true;
+            ctx->inputs[i].num_components = 4;
+            ctx->inputs[i].usage_mask = 0xf;
+         }
+         break;
       case TGSI_SEMANTIC_PATCH:
       case TGSI_SEMANTIC_GENERIC:
+      case TGSI_SEMANTIC_TEXCOORD:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
-            if (ctx->key->coord_replace & (1 << ctx->inputs[i].sid)) {
+            if (ctx->key->fs.coord_replace & (1 << ctx->inputs[i].sid)) {
                if (ctx->cfg->use_gles)
                   name_prefix = "vec4(gl_PointCoord.x, mix(1.0 - gl_PointCoord.y, gl_PointCoord.y, clamp(winsys_adjust_y, 0.0, 1.0)), 0.0, 1.0)";
                else
@@ -1179,12 +1425,12 @@ iter_declaration(struct tgsi_iterate_context *iter,
                ctx->inputs[i].glsl_predefined_no_emit = true;
                ctx->inputs[i].glsl_no_index = true;
                ctx->inputs[i].num_components = 4;
-               ctx->inputs[i].swizzle_offset = 0;
                ctx->inputs[i].usage_mask = 0xf;
                break;
             }
          }
-
+         /* fallthrough */
+      case TGSI_SEMANTIC_TESSCOORD:
          if (ctx->inputs[i].first != ctx->inputs[i].last ||
              ctx->inputs[i].array_id > 0) {
             ctx->guest_sent_io_arrays = true;
@@ -1195,10 +1441,6 @@ iter_declaration(struct tgsi_iterate_context *iter,
                ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
          }
-
-         /* fallthrough */
-      default:
-         name_prefix = get_stage_input_name_prefix(ctx, iter->processor.Processor);
          break;
       }
 
@@ -1208,15 +1450,18 @@ iter_declaration(struct tgsi_iterate_context *iter,
          if (ctx->inputs[i].name == TGSI_SEMANTIC_FOG){
             ctx->inputs[i].usage_mask = 0xf;
             ctx->inputs[i].num_components = 4;
-            ctx->inputs[i].swizzle_offset = 0;
             ctx->inputs[i].override_no_wm = false;
             snprintf(ctx->inputs[i].glsl_name, 128, "%s_f%d", name_prefix, ctx->inputs[i].sid);
          } else if (ctx->inputs[i].name == TGSI_SEMANTIC_COLOR)
             snprintf(ctx->inputs[i].glsl_name, 128, "%s_c%d", name_prefix, ctx->inputs[i].sid);
+         else if (ctx->inputs[i].name == TGSI_SEMANTIC_BCOLOR)
+            snprintf(ctx->inputs[i].glsl_name, 128, "%s_bc%d", name_prefix, ctx->inputs[i].sid);
          else if (ctx->inputs[i].name == TGSI_SEMANTIC_GENERIC)
             snprintf(ctx->inputs[i].glsl_name, 128, "%s_g%dA%d", name_prefix, ctx->inputs[i].sid, ctx->inputs[i].array_id);
          else if (ctx->inputs[i].name == TGSI_SEMANTIC_PATCH)
             snprintf(ctx->inputs[i].glsl_name, 128, "%s_p%dA%d", name_prefix, ctx->inputs[i].sid, ctx->inputs[i].array_id);
+         else if (ctx->inputs[i].name == TGSI_SEMANTIC_TEXCOORD)
+            snprintf(ctx->inputs[i].glsl_name, 64, "%s_t%d", name_prefix, ctx->inputs[i].sid);
          else
             snprintf(ctx->inputs[i].glsl_name, 128, "%s_%d", name_prefix, ctx->inputs[i].first);
       }
@@ -1253,13 +1498,18 @@ iter_declaration(struct tgsi_iterate_context *iter,
       ctx->outputs[i].last = decl->Range.Last;
       ctx->outputs[i].layout_location = 0;
       ctx->outputs[i].array_id = decl->Declaration.Array ? decl->Array.ArrayID : 0;
-      ctx->outputs[i].usage_mask  = mask_temp = decl->Declaration.UsageMask;
-      u_bit_scan_consecutive_range(&mask_temp, &ctx->outputs[i].swizzle_offset, &ctx->outputs[i].num_components);
+      ctx->outputs[i].usage_mask = decl->Declaration.UsageMask;
+      ctx->outputs[i].num_components = 4;
       ctx->outputs[i].glsl_predefined_no_emit = false;
       ctx->outputs[i].glsl_no_index = false;
       ctx->outputs[i].override_no_wm = ctx->outputs[i].num_components == 1;
       ctx->outputs[i].is_int = false;
       ctx->outputs[i].fbfetch_used = false;
+      ctx->outputs[i].overlapping_array = NULL;
+
+      map_overlapping_io_array(ctx->outputs, &ctx->outputs[i], ctx->num_outputs, decl);
+
+      name_prefix = get_stage_output_name_prefix(iter->processor.Processor);
 
       switch (ctx->outputs[i].name) {
       case TGSI_SEMANTIC_POSITION:
@@ -1296,7 +1546,7 @@ iter_declaration(struct tgsi_iterate_context *iter,
          name_prefix = "gl_ClipDistance";
          ctx->outputs[i].glsl_predefined_no_emit = true;
          ctx->outputs[i].glsl_no_index = true;
-         ctx->num_clip_dist += 4 * (ctx->outputs[i].last - ctx->outputs[i].first + 1);
+         ctx->num_out_clip_dist += 4 * (ctx->outputs[i].last - ctx->outputs[i].first + 1);
          if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX &&
              (ctx->key->gs_present || ctx->key->tcs_present))
             ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
@@ -1306,14 +1556,16 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->guest_sent_io_arrays = true;
          break;
       case TGSI_SEMANTIC_CLIPVERTEX:
-         name_prefix = "gl_ClipVertex";
-         ctx->outputs[i].glsl_predefined_no_emit = true;
-         ctx->outputs[i].glsl_no_index = true;
          ctx->outputs[i].override_no_wm = true;
          ctx->outputs[i].invariant = false;
-         ctx->outputs[i].precise = false;
-         if (ctx->glsl_ver_required >= 140)
+         if (ctx->glsl_ver_required >= 140) {
             ctx->has_clipvertex = true;
+            name_prefix = get_stage_output_name_prefix(iter->processor.Processor);
+         } else {
+            name_prefix = "gl_ClipVertex";
+            ctx->outputs[i].glsl_predefined_no_emit = true;
+            ctx->outputs[i].glsl_no_index = true;
+         }
          break;
       case TGSI_SEMANTIC_SAMPLEMASK:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
@@ -1328,41 +1580,36 @@ iter_declaration(struct tgsi_iterate_context *iter,
          break;
       case TGSI_SEMANTIC_COLOR:
          if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
-            ctx->outputs[i].type = get_type(ctx->key->cbufs_signed_int_bitmask,
-                                            ctx->key->cbufs_unsigned_int_bitmask,
+            ctx->outputs[i].type = get_type(ctx->key->fs.cbufs_signed_int_bitmask,
+                                            ctx->key->fs.cbufs_unsigned_int_bitmask,
                                             ctx->outputs[i].sid);
-         }
-
-         if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX) {
+            name_prefix = ctx->key->fs.logicop_enabled ? "fsout_tmp" : "fsout";
+            ctx->fs_has_color_outputs = true;
+         } else {
             if (ctx->glsl_ver_required < 140) {
                ctx->outputs[i].glsl_no_index = true;
                if (ctx->outputs[i].sid == 0)
                   name_prefix = "gl_FrontColor";
                else if (ctx->outputs[i].sid == 1)
                   name_prefix = "gl_FrontSecondaryColor";
-            } else
-               name_prefix = "ex";
-            break;
-         } else if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT &&
-                    ctx->key->fs_logicop_enabled) {
-            name_prefix = "fsout_tmp";
-            break;
+            } else {
+                      ctx->color_out_mask |= (1 << decl->Semantic.Index);
+            }
          }
-         /* fallthrough */
+         ctx->outputs[i].override_no_wm = false;
+         break;
       case TGSI_SEMANTIC_BCOLOR:
-         if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX) {
-            if (ctx->glsl_ver_required < 140) {
-               ctx->outputs[i].glsl_no_index = true;
-               if (ctx->outputs[i].sid == 0)
-                  name_prefix = "gl_BackColor";
-               else if (ctx->outputs[i].sid == 1)
-                  name_prefix = "gl_BackSecondaryColor";
-               break;
-            } else
-               name_prefix = "ex";
-            break;
+         if (ctx->glsl_ver_required < 140) {
+            ctx->outputs[i].glsl_no_index = true;
+            if (ctx->outputs[i].sid == 0)
+               name_prefix = "gl_BackColor";
+            else if (ctx->outputs[i].sid == 1)
+               name_prefix = "gl_BackSecondaryColor";
+         } else {
+            ctx->outputs[i].override_no_wm = false;
+            ctx->color_out_mask |= (1 << decl->Semantic.Index) << 2;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_PSIZE:
          if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX ||
              iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
@@ -1373,11 +1620,11 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->outputs[i].override_no_wm = true;
             ctx->shader_req_bits |= SHADER_REQ_PSIZE;
             name_prefix = "gl_PointSize";
+            ctx->has_pointsize_output = true;
             if (iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL)
                ctx->outputs[i].glsl_gl_block = true;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_LAYER:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
@@ -1385,9 +1632,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->outputs[i].override_no_wm = true;
             ctx->outputs[i].is_int = true;
             name_prefix = "gl_Layer";
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_PRIMID:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
@@ -1395,9 +1641,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
             ctx->outputs[i].override_no_wm = true;
             ctx->outputs[i].is_int = true;
             name_prefix = "gl_PrimitiveID";
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_VIEWPORT_INDEX:
          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
@@ -1407,29 +1652,29 @@ iter_declaration(struct tgsi_iterate_context *iter,
             name_prefix = "gl_ViewportIndex";
             if (ctx->glsl_ver_required >= 140 || ctx->cfg->use_gles)
                ctx->shader_req_bits |= SHADER_REQ_VIEWPORT_IDX;
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_TESSOUTER:
          if (iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
             ctx->outputs[i].glsl_no_index = true;
             ctx->outputs[i].override_no_wm = true;
             name_prefix = "gl_TessLevelOuter";
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_TESSINNER:
          if (iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
             ctx->outputs[i].glsl_no_index = true;
             ctx->outputs[i].override_no_wm = true;
             name_prefix = "gl_TessLevelInner";
-            break;
          }
-         /* fallthrough */
+         break;
       case TGSI_SEMANTIC_PATCH:
       case TGSI_SEMANTIC_GENERIC:
+      case TGSI_SEMANTIC_TEXCOORD:
+      case TGSI_SEMANTIC_TESSCOORD:
+
          if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX)
             if (ctx->outputs[i].name == TGSI_SEMANTIC_GENERIC)
                color_offset = -1;
@@ -1445,9 +1690,6 @@ iter_declaration(struct tgsi_iterate_context *iter,
                ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
          }
-         /* fallthrough */
-      default:
-         name_prefix = get_stage_output_name_prefix(iter->processor.Processor);
          break;
       }
 
@@ -1457,7 +1699,6 @@ iter_declaration(struct tgsi_iterate_context *iter,
          if (ctx->outputs[i].name == TGSI_SEMANTIC_FOG) {
             ctx->outputs[i].usage_mask = 0xf;
             ctx->outputs[i].num_components = 4;
-            ctx->outputs[i].swizzle_offset = 0;
             ctx->outputs[i].override_no_wm = false;
             snprintf(ctx->outputs[i].glsl_name, 64, "%s_f%d", name_prefix, ctx->outputs[i].sid);
          } else if (ctx->outputs[i].name == TGSI_SEMANTIC_COLOR)
@@ -1468,6 +1709,8 @@ iter_declaration(struct tgsi_iterate_context *iter,
             snprintf(ctx->outputs[i].glsl_name, 64, "%s_p%dA%d", name_prefix, ctx->outputs[i].sid, ctx->outputs[i].array_id);
          else if (ctx->outputs[i].name == TGSI_SEMANTIC_GENERIC)
             snprintf(ctx->outputs[i].glsl_name, 64, "%s_g%dA%d", name_prefix, ctx->outputs[i].sid, ctx->outputs[i].array_id);
+         else if (ctx->outputs[i].name == TGSI_SEMANTIC_TEXCOORD)
+            snprintf(ctx->outputs[i].glsl_name, 64, "%s_t%d", name_prefix, ctx->outputs[i].sid);
          else
             snprintf(ctx->outputs[i].glsl_name, 64, "%s_%d", name_prefix, ctx->outputs[i].first + color_offset);
 
@@ -1657,6 +1900,7 @@ iter_property(struct tgsi_iterate_context *iter,
       break;
    case TGSI_PROPERTY_GS_INVOCATIONS:
       ctx->gs_num_invocations = prop->u[0].Data;
+      ctx->shader_req_bits |= SHADER_REQ_GPU_SHADER5;
       break;
    case TGSI_PROPERTY_NUM_CLIPDIST_ENABLED:
       ctx->shader_req_bits |= SHADER_REQ_CLIP_DISTANCE;
@@ -1767,23 +2011,10 @@ static void emit_a8_swizzle(struct vrend_glsl_strbufs *glsl_strbufs)
    emit_buf(glsl_strbufs, "fsout_c0.x = fsout_c0.w;\n");
 }
 
-static const char *atests[PIPE_FUNC_ALWAYS + 1] = {
-   "false",
-   "<",
-   "==",
-   "<=",
-   ">",
-   "!=",
-   ">=",
-   "true"
-};
-
 static void emit_alpha_test(const struct dump_ctx *ctx,
                             struct vrend_glsl_strbufs *glsl_strbufs)
 {
-   char comp_buf[128];
-
-   if (!ctx->num_outputs)
+   if (!ctx->fs_has_color_outputs)
       return;
 
    if (!ctx->write_all_cbufs) {
@@ -1791,26 +2022,19 @@ static void emit_alpha_test(const struct dump_ctx *ctx,
       if (ctx->outputs[0].sid != 0)
          return;
    }
-   switch (ctx->key->alpha_test) {
-   case PIPE_FUNC_NEVER:
-   case PIPE_FUNC_ALWAYS:
-      snprintf(comp_buf, 128, "%s", atests[ctx->key->alpha_test]);
-      break;
-   case PIPE_FUNC_LESS:
-   case PIPE_FUNC_EQUAL:
-   case PIPE_FUNC_LEQUAL:
-   case PIPE_FUNC_GREATER:
-   case PIPE_FUNC_NOTEQUAL:
-   case PIPE_FUNC_GEQUAL:
-      snprintf(comp_buf, 128, "%s %s alpha_ref_val", "fsout_c0.w", atests[ctx->key->alpha_test]);
-      break;
-   default:
-      vrend_printf( "invalid alpha-test: %x\n", ctx->key->alpha_test);
-      set_buf_error(glsl_strbufs);
-      return;
-   }
 
-   emit_buff(glsl_strbufs, "if (!(%s)) {\n\tdiscard;\n}\n", comp_buf);
+   emit_buff(glsl_strbufs, "if (alpha_func != 7 /* PIPE_FUNC_ALWAYS */) {\n"
+                           "  switch (alpha_func) {\n"
+                           "  case 0: discard; break;\n"
+                           "  case 1: if (!(fsout_c0.w < alpha_ref_val)) discard; break;\n"
+                           "  case 2: if (!(fsout_c0.w == alpha_ref_val)) discard; break;\n"
+                           "  case 3: if (!(fsout_c0.w <= alpha_ref_val)) discard; break;\n"
+                           "  case 4: if (!(fsout_c0.w > alpha_ref_val)) discard; break;\n"
+                           "  case 5: if (!(fsout_c0.w != alpha_ref_val)) discard; break;\n"
+                           "  case 6: if (!(fsout_c0.w >= alpha_ref_val)) discard; break;\n"
+                           "  default: break;\n"
+                           "  }\n"
+                           "}\n");
 }
 
 static void emit_pstipple_pass(struct vrend_glsl_strbufs *glsl_strbufs)
@@ -1825,11 +2049,14 @@ static void emit_color_select(const struct dump_ctx *ctx,
    if (!ctx->key->color_two_side || !(ctx->color_in_mask & 0x3))
       return;
 
+   const char *name_prefix = get_stage_input_name_prefix(ctx, ctx->prog_type);
    if (ctx->color_in_mask & 1)
-      emit_buf(glsl_strbufs, "realcolor0 = gl_FrontFacing ? ex_c0 : ex_bc0;\n");
+      emit_buff(glsl_strbufs, "realcolor0 = gl_FrontFacing ? %s_c0 : %s_bc0;\n",
+               name_prefix, name_prefix);
 
    if (ctx->color_in_mask & 2)
-      emit_buf(glsl_strbufs, "realcolor1 = gl_FrontFacing ? ex_c1 : ex_bc1;\n");
+      emit_buff(glsl_strbufs, "realcolor1 = gl_FrontFacing ? %s_c1 : %s_bc1;\n",
+                name_prefix, name_prefix);
 }
 
 static void emit_prescale(struct vrend_glsl_strbufs *glsl_strbufs)
@@ -1885,7 +2112,9 @@ get_blockvarname(char outvar[64], const char *stage_prefix, const struct vrend_s
 
 static void get_so_name(const struct dump_ctx *ctx, bool from_block, const struct vrend_shader_io *output, int index, char out_var[255], char *wm)
 {
-   if (output->first == output->last || output->name != TGSI_SEMANTIC_GENERIC)
+   if (output->first == output->last ||
+       (output->name != TGSI_SEMANTIC_GENERIC &&
+        output->name != TGSI_SEMANTIC_TEXCOORD))
       snprintf(out_var, 255, "%s%s", output->glsl_name, wm);
    else {
       if ((output->name == TGSI_SEMANTIC_GENERIC) && prefer_generic_io_block(ctx, io_out)) {
@@ -1939,12 +2168,18 @@ static void emit_so_movs(const struct dump_ctx *ctx,
             free(ctx->so_names[i]);
          if (ctx->so->output[i].register_index > ctx->num_outputs)
             ctx->so_names[i] = NULL;
-         else if (ctx->outputs[ctx->so->output[i].register_index].name == TGSI_SEMANTIC_CLIPVERTEX && ctx->has_clipvertex) {
+         else if (output->name == TGSI_SEMANTIC_CLIPVERTEX && ctx->has_clipvertex) {
             ctx->so_names[i] = strdup("clipv_tmp");
             *has_clipvertex_so = true;
          } else {
             char out_var[255];
-            get_so_name(ctx, true, output, ctx->so->output[i].register_index, out_var, "");
+            const struct vrend_shader_io *used_output_io = output;
+            if (output->name == TGSI_SEMANTIC_GENERIC && ctx->generic_ios.output_range.used) {
+               used_output_io = &ctx->generic_ios.output_range.io;
+            } else if (output->name == TGSI_SEMANTIC_PATCH && ctx->patch_ios.output_range.used) {
+               used_output_io = &ctx->patch_ios.output_range.io;
+            }
+            get_so_name(ctx, true, used_output_io, ctx->so->output[i].register_index, out_var, "");
             ctx->so_names[i] = strdup(out_var);
          }
       } else {
@@ -1953,7 +2188,7 @@ static void emit_so_movs(const struct dump_ctx *ctx,
          ctx->so_names[i] = strdup(ntemp);
       }
       if (ctx->so->output[i].num_components == 1) {
-         if (ctx->outputs[ctx->so->output[i].register_index].is_int)
+         if (output->is_int)
             snprintf(outtype, 15, "intBitsToFloat");
          else
             snprintf(outtype, 15, "float");
@@ -1993,20 +2228,30 @@ static void emit_clip_dist_movs(const struct dump_ctx *ctx,
 {
    int i;
    bool has_prop = (ctx->num_clip_dist_prop + ctx->num_cull_dist_prop) > 0;
+   int num_clip = has_prop ? ctx->num_clip_dist_prop : ctx->key->num_out_clip;
+   int num_cull = has_prop ? ctx->num_cull_dist_prop : ctx->key->num_out_cull;
+
+
+   int num_clip_cull = num_cull + num_clip;
+   if (ctx->num_out_clip_dist && !num_clip_cull)
+      num_clip = ctx->num_out_clip_dist;
+
    int ndists;
    const char *prefix="";
 
    if (ctx->prog_type == PIPE_SHADER_TESS_CTRL)
       prefix = "gl_out[gl_InvocationID].";
-   if (ctx->num_clip_dist == 0 && ctx->key->clip_plane_enable) {
+   if (ctx->num_out_clip_dist == 0 && ctx->is_last_vertex_stage) {
+      emit_buff(glsl_strbufs, "if (clip_plane_enabled) {\n");
       for (i = 0; i < 8; i++) {
-         emit_buff(glsl_strbufs, "%sgl_ClipDistance[%d] = dot(%s, clipp[%d]);\n", prefix, i, ctx->has_clipvertex ? "clipv_tmp" : "gl_Position", i);
+         emit_buff(glsl_strbufs, "  %sgl_ClipDistance[%d] = dot(%s, clipp[%d]);\n",
+                   prefix, i, ctx->has_clipvertex ? "clipv_tmp" : "gl_Position", i);
       }
-      return;
+      emit_buff(glsl_strbufs, "}\n");
    }
-   ndists = ctx->num_clip_dist;
+   ndists = ctx->num_out_clip_dist;
    if (has_prop)
-      ndists = ctx->num_clip_dist_prop + ctx->num_cull_dist_prop;
+      ndists = num_clip + num_cull;
    for (i = 0; i < ndists; i++) {
       int clipidx = i < 4 ? 0 : 1;
       char swiz = i & 3;
@@ -2019,13 +2264,53 @@ static void emit_clip_dist_movs(const struct dump_ctx *ctx,
       case 3: wm = 'w'; break;
       }
       bool is_cull = false;
-      if (has_prop) {
-         if (i >= ctx->num_clip_dist_prop && i < ctx->num_clip_dist_prop + ctx->num_cull_dist_prop)
+      const char *clip_cull = "Clip";
+
+      if (i >= num_clip) {
+         if (i < ndists) {
             is_cull = true;
+            clip_cull = "Cull";
+         } else {
+            clip_cull = "ERROR";
+         }
       }
-      const char *clip_cull = is_cull ? "Cull" : "Clip";
+
       emit_buff(glsl_strbufs, "%sgl_%sDistance[%d] = clip_dist_temp[%d].%c;\n", prefix, clip_cull,
-               is_cull ? i - ctx->num_clip_dist_prop : i, clipidx, wm);
+               is_cull ? i - num_clip : i, clipidx, wm);
+   }
+}
+
+static void emit_fog_fixup_hdr(const struct dump_ctx *ctx,
+                               struct vrend_glsl_strbufs *glsl_strbufs)
+{
+   uint32_t fixup_mask = ctx->key->vs.fog_fixup_mask;
+   int semantic;
+   const char *prefix = get_stage_output_name_prefix(TGSI_PROCESSOR_VERTEX);
+
+   while (fixup_mask) {
+      semantic = ffs(fixup_mask) - 1;
+
+      emit_hdrf(glsl_strbufs, "out vec4 %s_f%d;\n", prefix, semantic);
+      fixup_mask &= (~(1 << semantic));
+   }
+}
+
+static void emit_fog_fixup_write(const struct dump_ctx *ctx,
+                                 struct vrend_glsl_strbufs *glsl_strbufs)
+{
+   uint32_t fixup_mask = ctx->key->vs.fog_fixup_mask;
+   int semantic;
+   const char *prefix = get_stage_output_name_prefix(TGSI_PROCESSOR_VERTEX);
+
+   while (fixup_mask) {
+      semantic = ffs(fixup_mask) - 1;
+
+      /*
+      *  Force unwritten fog outputs to 0,0,0,1
+      */
+      emit_buff(glsl_strbufs, "%s_f%d = vec4(0.0, 0.0, 0.0, 1.0);\n",
+               prefix, semantic);
+      fixup_mask &= (~(1 << semantic));
    }
 }
 
@@ -2042,10 +2327,14 @@ static void handle_vertex_proc_exit(const struct dump_ctx *ctx,
     if (ctx->so && !ctx->key->gs_present && !ctx->key->tes_present)
        emit_so_movs(ctx, glsl_strbufs, has_clipvertex_so);
 
-    emit_clip_dist_movs(ctx, glsl_strbufs);
+    if (ctx->cfg->has_cull_distance)
+       emit_clip_dist_movs(ctx, glsl_strbufs);
 
     if (!ctx->key->gs_present && !ctx->key->tes_present)
        emit_prescale(glsl_strbufs);
+
+    if (ctx->key->vs.fog_fixup_mask)
+       emit_fog_fixup_write(ctx, glsl_strbufs);
 }
 
 static void emit_fragment_logicop(const struct dump_ctx *ctx,
@@ -2058,9 +2347,9 @@ static void emit_fragment_logicop(const struct dump_ctx *ctx,
    char full_op[PIPE_MAX_COLOR_BUFS][128 + 8];
 
    for (unsigned i = 0; i < ctx->num_outputs; i++) {
-      mask[i] = (1 << ctx->key->surface_component_bits[i]) - 1;
+      mask[i] = (1 << ctx->key->fs.surface_component_bits[i]) - 1;
       scale[i] = mask[i];
-      switch (ctx->key->fs_logicop_func) {
+      switch (ctx->key->fs.logicop_func) {
       case PIPE_LOGICOP_INVERT:
          snprintf(src_fb[i], ARRAY_SIZE(src_fb[i]),
                   "ivec4(%f * fsout_c%d + 0.5)", scale[i], i);
@@ -2091,7 +2380,7 @@ static void emit_fragment_logicop(const struct dump_ctx *ctx,
    }
 
    for (unsigned i = 0; i < ctx->num_outputs; i++) {
-      switch (ctx->key->fs_logicop_func) {
+      switch (ctx->key->fs.logicop_func) {
       case PIPE_LOGICOP_CLEAR:
          snprintf(full_op[i], ARRAY_SIZE(full_op[i]),
                   "%s", "vec4(0)");
@@ -2159,7 +2448,7 @@ static void emit_fragment_logicop(const struct dump_ctx *ctx,
    }
 
    for (unsigned i = 0; i < ctx->num_outputs; i++) {
-      switch (ctx->key->fs_logicop_func) {
+      switch (ctx->key->fs.logicop_func) {
       case PIPE_LOGICOP_NOOP:
          break;
       case PIPE_LOGICOP_COPY:
@@ -2176,9 +2465,31 @@ static void emit_fragment_logicop(const struct dump_ctx *ctx,
 static void emit_cbuf_swizzle(const struct dump_ctx *ctx,
                               struct vrend_glsl_strbufs *glsl_strbufs)
 {
+   int cbuf_id = 0;
    for (uint i = 0; i < ctx->num_outputs; i++) {
-      if (ctx->key->fs_swizzle_output_rgb_to_bgr & (1 << i)) {
-         emit_buff(glsl_strbufs, "fsout_c%d = fsout_c%d.zyxw;\n", i, i);
+      if (ctx->outputs[i].name == TGSI_SEMANTIC_COLOR) {
+         if (ctx->key->fs.swizzle_output_rgb_to_bgr & (1 << cbuf_id)) {
+            emit_buff(glsl_strbufs, "fsout_c%d = fsout_c%d.zyxw;\n", cbuf_id, cbuf_id);
+         }
+         ++cbuf_id;
+      }
+   }
+}
+
+static void emit_cbuf_colorspace_convert(const struct dump_ctx *ctx,
+                                         struct vrend_glsl_strbufs *glsl_strbufs)
+{
+   for (uint i = 0; i < ctx->num_outputs; i++) {
+      if (ctx->key->fs.needs_manual_srgb_encode_bitmask & (1 << i)) {
+         emit_buff(glsl_strbufs,
+                   "{\n"
+                   "   vec3 temp = fsout_c%d.xyz;\n"
+                   "   bvec3 thresh = lessThanEqual(temp, vec3(0.0031308));\n"
+                   "   vec3 a = temp * vec3(12.92);\n"
+                   "   vec3 b = ( vec3(1.055) * pow(temp, vec3(1.0/2.4)) ) - vec3(0.055);\n"
+                   "   fsout_c%d.xyz = mix(b, a, thresh);\n"
+                   "}\n"
+                   , i, i);
       }
    }
 }
@@ -2189,18 +2500,20 @@ static void handle_fragment_proc_exit(const struct dump_ctx *ctx,
     if (ctx->key->pstipple_tex)
        emit_pstipple_pass(glsl_strbufs);
 
-    if (ctx->key->cbufs_are_a8_bitmask)
+    if (ctx->key->fs.cbufs_are_a8_bitmask)
        emit_a8_swizzle(glsl_strbufs);
 
-    if (ctx->key->add_alpha_test)
-       emit_alpha_test(ctx, glsl_strbufs);
+    if (ctx->cfg->use_core_profile)
+        emit_alpha_test(ctx, glsl_strbufs);
 
-
-    if (ctx->key->fs_logicop_enabled)
+    if (ctx->key->fs.logicop_enabled)
        emit_fragment_logicop(ctx, glsl_strbufs);
 
-    if (ctx->key->fs_swizzle_output_rgb_to_bgr)
+    if (ctx->key->fs.swizzle_output_rgb_to_bgr)
        emit_cbuf_swizzle(ctx, glsl_strbufs);
+
+    if (ctx->key->fs.needs_manual_srgb_encode_bitmask)
+       emit_cbuf_colorspace_convert(ctx, glsl_strbufs);
 
     if (ctx->write_all_cbufs)
        emit_cbuf_writes(ctx, glsl_strbufs);
@@ -2228,6 +2541,7 @@ static void set_texture_reqs(struct dump_ctx *ctx,
 }
 
 // TODO Consider exposing non-const ctx-> members as args to make *ctx const
+
 /* size queries are pretty much separate */
 static void emit_txq(struct dump_ctx *ctx,
                      const struct tgsi_full_instruction *inst,
@@ -2258,7 +2572,7 @@ static void emit_txq(struct dump_ctx *ctx,
    case TGSI_TEXTURE_2D_ARRAY_MSAA:
       break;
    default:
-      snprintf(bias, 128, ", int(%s.w)", srcs[0]);
+      snprintf(bias, 128, ", int(%s.x)", srcs[0]);
    }
 
    /* need to emit a textureQueryLevels */
@@ -2271,9 +2585,32 @@ static void emit_txq(struct dump_ctx *ctx,
          ctx->shader_req_bits |= SHADER_REQ_TXQ_LEVELS;
          if (inst->Dst[0].Register.WriteMask & 0x7)
             twm = TGSI_WRITEMASK_W;
-         emit_buff(&ctx->glsl_strbufs, "%s%s = %s(textureQueryLevels(%s));\n", dst,
-                   get_wm_string(twm), get_string(dtypeprefix),
-                   srcs[sampler_index]);
+
+         if (!ctx->cfg->use_gles) {
+            emit_buff(&ctx->glsl_strbufs, "%s%s = %s(textureQueryLevels(%s));\n", dst,
+                      get_wm_string(twm), get_string(dtypeprefix),
+                      srcs[sampler_index]);
+         } else {
+            const struct tgsi_full_src_register *src = &inst->Src[1];
+
+            int gles_sampler_index = 0;
+            for (int i = 0; i < src->Register.Index; ++i) {
+               if (ctx->samplers_used & (1 << i))
+                  ++gles_sampler_index;
+            }
+
+            char sampler_str[64];
+
+            if (ctx->info.indirect_files & (1 << TGSI_FILE_SAMPLER) && src->Register.Indirect) {
+               snprintf(sampler_str, sizeof(sampler_str), "addr%d+%d", src->Indirect.Index, gles_sampler_index);
+            } else {
+               snprintf(sampler_str, sizeof(sampler_str), "%d", gles_sampler_index);
+            }
+            emit_buff(&ctx->glsl_strbufs, "%s%s = %s(%s_texlod[%s]);\n", dst, get_wm_string(twm),
+                      get_string(dtypeprefix), tgsi_proc_to_prefix(ctx->info.processor),
+                      sampler_str);
+            ctx->gles_use_tex_query_level = true;
+         }
       }
 
       if (inst->Dst[0].Register.WriteMask & 0x7) {
@@ -2307,6 +2644,7 @@ static void emit_txq(struct dump_ctx *ctx,
    }
 
    if (inst->Dst[0].Register.WriteMask & 0x7) {
+      char wm_buffer[16];
       bool txq_returns_vec = (inst->Texture.Texture != TGSI_TEXTURE_BUFFER) &&
                              (ctx->cfg->use_gles ||
                               (inst->Texture.Texture != TGSI_TEXTURE_1D &&
@@ -2315,7 +2653,8 @@ static void emit_txq(struct dump_ctx *ctx,
       if (ctx->cfg->use_gles &&
           (inst->Texture.Texture == TGSI_TEXTURE_1D_ARRAY ||
            inst->Texture.Texture == TGSI_TEXTURE_SHADOW1D_ARRAY)) {
-         writemask = ".xz";
+         snprintf(wm_buffer, sizeof(wm_buffer), ".xz%s", writemask);
+         writemask = wm_buffer;
       }
 
       emit_buff(&ctx->glsl_strbufs, "%s%s = %s(textureSize(%s%s))%s;\n", dst,
@@ -2390,7 +2729,7 @@ static const char *get_tex_inst_ext(const struct tgsi_full_instruction *inst)
 
 static bool fill_offset_buffer(const struct dump_ctx *ctx,
                                const struct tgsi_full_instruction *inst,
-                               char *offbuf)
+                               struct vrend_strbuf *offset_buf)
 {
    if (inst->TexOffsets[0].File == TGSI_FILE_IMMEDIATE) {
       const struct immed *imd = &ctx->imm[inst->TexOffsets[0].Index];
@@ -2400,9 +2739,9 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
       case TGSI_TEXTURE_SHADOW1D:
       case TGSI_TEXTURE_SHADOW1D_ARRAY:
          if (!ctx->cfg->use_gles)
-            snprintf(offbuf, 512, ", int(%d)", imd->val[inst->TexOffsets[0].SwizzleX].i);
+            strbuf_appendf(offset_buf, ", int(%d)", imd->val[inst->TexOffsets[0].SwizzleX].i);
          else
-            snprintf(offbuf, 512, ", ivec2(%d, 0)", imd->val[inst->TexOffsets[0].SwizzleX].i);
+            strbuf_appendf(offset_buf, ", ivec2(%d, 0)", imd->val[inst->TexOffsets[0].SwizzleX].i);
          break;
       case TGSI_TEXTURE_RECT:
       case TGSI_TEXTURE_SHADOWRECT:
@@ -2410,10 +2749,10 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
       case TGSI_TEXTURE_2D_ARRAY:
       case TGSI_TEXTURE_SHADOW2D:
       case TGSI_TEXTURE_SHADOW2D_ARRAY:
-         snprintf(offbuf, 512, ", ivec2(%d, %d)", imd->val[inst->TexOffsets[0].SwizzleX].i, imd->val[inst->TexOffsets[0].SwizzleY].i);
+         strbuf_appendf(offset_buf, ", ivec2(%d, %d)", imd->val[inst->TexOffsets[0].SwizzleX].i, imd->val[inst->TexOffsets[0].SwizzleY].i);
          break;
       case TGSI_TEXTURE_3D:
-         snprintf(offbuf, 512, ", ivec3(%d, %d, %d)", imd->val[inst->TexOffsets[0].SwizzleX].i, imd->val[inst->TexOffsets[0].SwizzleY].i,
+         strbuf_appendf(offset_buf, ", ivec3(%d, %d, %d)", imd->val[inst->TexOffsets[0].SwizzleX].i, imd->val[inst->TexOffsets[0].SwizzleY].i,
                   imd->val[inst->TexOffsets[0].SwizzleZ].i);
          break;
       default:
@@ -2428,7 +2767,7 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
       case TGSI_TEXTURE_1D_ARRAY:
       case TGSI_TEXTURE_SHADOW1D:
       case TGSI_TEXTURE_SHADOW1D_ARRAY:
-         snprintf(offbuf, 512, ", int(floatBitsToInt(temp%d[%d].%c))",
+         strbuf_appendf(offset_buf, ", int(floatBitsToInt(temp%d[%d].%c))",
                   range->first, idx,
                   get_swiz_char(inst->TexOffsets[0].SwizzleX));
          break;
@@ -2438,14 +2777,14 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
       case TGSI_TEXTURE_2D_ARRAY:
       case TGSI_TEXTURE_SHADOW2D:
       case TGSI_TEXTURE_SHADOW2D_ARRAY:
-         snprintf(offbuf, 512, ", ivec2(floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c))",
+         strbuf_appendf(offset_buf, ", ivec2(floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c))",
                   range->first, idx,
                   get_swiz_char(inst->TexOffsets[0].SwizzleX),
                   range->first, idx,
                   get_swiz_char(inst->TexOffsets[0].SwizzleY));
             break;
       case TGSI_TEXTURE_3D:
-         snprintf(offbuf, 512, ", ivec3(floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c)",
+         strbuf_appendf(offset_buf, ", ivec3(floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c), floatBitsToInt(temp%d[%d].%c)",
                   range->first, idx,
                   get_swiz_char(inst->TexOffsets[0].SwizzleX),
                   range->first, idx,
@@ -2467,7 +2806,7 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
          case TGSI_TEXTURE_1D_ARRAY:
          case TGSI_TEXTURE_SHADOW1D:
          case TGSI_TEXTURE_SHADOW1D_ARRAY:
-            snprintf(offbuf, 512, ", int(floatBitsToInt(%s.%c))",
+            strbuf_appendf(offset_buf, ", int(floatBitsToInt(%s.%c))",
                      ctx->inputs[j].glsl_name,
                      get_swiz_char(inst->TexOffsets[0].SwizzleX));
             break;
@@ -2477,14 +2816,14 @@ static bool fill_offset_buffer(const struct dump_ctx *ctx,
          case TGSI_TEXTURE_2D_ARRAY:
          case TGSI_TEXTURE_SHADOW2D:
          case TGSI_TEXTURE_SHADOW2D_ARRAY:
-            snprintf(offbuf, 512, ", ivec2(floatBitsToInt(%s.%c), floatBitsToInt(%s.%c))",
+            strbuf_appendf(offset_buf, ", ivec2(floatBitsToInt(%s.%c), floatBitsToInt(%s.%c))",
                      ctx->inputs[j].glsl_name,
                      get_swiz_char(inst->TexOffsets[0].SwizzleX),
                      ctx->inputs[j].glsl_name,
                      get_swiz_char(inst->TexOffsets[0].SwizzleY));
             break;
          case TGSI_TEXTURE_3D:
-            snprintf(offbuf, 512, ", ivec3(floatBitsToInt(%s.%c), floatBitsToInt(%s.%c), floatBitsToInt(%s.%c)",
+            strbuf_appendf(offset_buf, ", ivec3(floatBitsToInt(%s.%c), floatBitsToInt(%s.%c), floatBitsToInt(%s.%c)",
                      ctx->inputs[j].glsl_name,
                      get_swiz_char(inst->TexOffsets[0].SwizzleX),
                      ctx->inputs[j].glsl_name,
@@ -2515,10 +2854,15 @@ static void translate_tex(struct dump_ctx *ctx,
    unsigned twm = TGSI_WRITEMASK_NONE, gwm = TGSI_WRITEMASK_NONE;
    enum vrend_type_qualifier dtypeprefix = TYPE_CONVERSION_NONE;
    bool is_shad;
-   char offbuf[512] = "";
-   char bias[256] = "";
+
    int sampler_index;
    const char *tex_ext;
+
+   struct vrend_strbuf bias_buf;
+   struct vrend_strbuf offset_buf;
+
+   strbuf_alloc(&bias_buf, 128);
+   strbuf_alloc(&offset_buf, 128);
 
    set_texture_reqs(ctx, inst, sinfo->sreg_index);
    is_shad = samplertype_is_shadow(inst->Texture.Texture);
@@ -2640,13 +2984,18 @@ static void translate_tex(struct dump_ctx *ctx,
    case TGSI_OPCODE_TEX2:
       sampler_index = 2;
       if (inst->Instruction.Opcode != TGSI_OPCODE_TEX2)
-         snprintf(bias, 64, ", %s.x", srcs[1]);
+         strbuf_appendf(&bias_buf, ", %s.x", srcs[1]);
       else if (inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE_ARRAY)
-         snprintf(bias, 64, ", float(%s)", srcs[1]);
+         strbuf_appendf(&bias_buf, ", float(%s)", srcs[1]);
       break;
    case TGSI_OPCODE_TXB:
    case TGSI_OPCODE_TXL:
-      snprintf(bias, 64, ", %s.w", srcs[0]);
+      /* On GLES we emulate the 1D array by using a 2D array, for this
+       * there is no shadow lookup with bias. To avoid that compiling an
+       * invalid shader results in a crash we ignore the bias value */
+      if (!(ctx->cfg->use_gles &&
+            TGSI_TEXTURE_SHADOW1D_ARRAY == inst->Texture.Texture))
+         strbuf_appendf(&bias_buf, ", %s.w", srcs[0]);
       break;
    case TGSI_OPCODE_TXF:
       if (inst->Texture.Texture == TGSI_TEXTURE_1D ||
@@ -2656,16 +3005,16 @@ static void translate_tex(struct dump_ctx *ctx,
           inst->Texture.Texture == TGSI_TEXTURE_3D ||
           inst->Texture.Texture == TGSI_TEXTURE_1D_ARRAY ||
           inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY)
-         snprintf(bias, 64, ", int(%s.w)", srcs[0]);
+         strbuf_appendf(&bias_buf, ", int(%s.w)", srcs[0]);
       break;
    case TGSI_OPCODE_TXD:
       if (ctx->cfg->use_gles && (inst->Texture.Texture == TGSI_TEXTURE_1D ||
                                  inst->Texture.Texture == TGSI_TEXTURE_SHADOW1D ||
                                  inst->Texture.Texture == TGSI_TEXTURE_1D_ARRAY ||
                                  inst->Texture.Texture == TGSI_TEXTURE_SHADOW1D_ARRAY))
-         snprintf(bias, 128, ", vec2(%s%s, 0), vec2(%s%s, 0)", srcs[1], get_wm_string(gwm), srcs[2], get_wm_string(gwm));
+         strbuf_appendf(&bias_buf, ", vec2(%s%s, 0), vec2(%s%s, 0)", srcs[1], get_wm_string(gwm), srcs[2], get_wm_string(gwm));
       else
-         snprintf(bias, 128, ", %s%s, %s%s", srcs[1], get_wm_string(gwm), srcs[2], get_wm_string(gwm));
+         strbuf_appendf(&bias_buf, ", %s%s, %s%s", srcs[1], get_wm_string(gwm), srcs[2], get_wm_string(gwm));
       sampler_index = 3;
       break;
    case TGSI_OPCODE_TG4:
@@ -2682,11 +3031,11 @@ static void translate_tex(struct dump_ctx *ctx,
       if (is_shad) {
          if (inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE ||
              inst->Texture.Texture == TGSI_TEXTURE_SHADOW2D_ARRAY)
-            snprintf(bias, 64, ", %s.w", srcs[0]);
+            strbuf_appendf(&bias_buf, ", %s.w", srcs[0]);
          else if (inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE_ARRAY)
-            snprintf(bias, 64, ", %s.x", srcs[1]);
+            strbuf_appendf(&bias_buf, ", %s.x", srcs[1]);
          else
-            snprintf(bias, 64, ", %s.z", srcs[0]);
+            strbuf_appendf(&bias_buf, ", %s.z", srcs[0]);
       } else if (sinfo->tg4_has_component) {
          if (inst->Texture.NumOffsets == 0) {
             if (inst->Texture.Texture == TGSI_TEXTURE_2D ||
@@ -2694,65 +3043,81 @@ static void translate_tex(struct dump_ctx *ctx,
                 inst->Texture.Texture == TGSI_TEXTURE_CUBE ||
                 inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY ||
                 inst->Texture.Texture == TGSI_TEXTURE_CUBE_ARRAY)
-               snprintf(bias, 64, ", int(%s)", srcs[1]);
+               strbuf_appendf(&bias_buf, ", int(%s)", srcs[1]);
          } else if (inst->Texture.NumOffsets) {
             if (inst->Texture.Texture == TGSI_TEXTURE_2D ||
                 inst->Texture.Texture == TGSI_TEXTURE_RECT ||
                 inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY)
-               snprintf(bias, 64, ", int(%s)", srcs[1]);
+               strbuf_appendf(&bias_buf, ", int(%s)", srcs[1]);
          }
       }
       break;
    default:
-      bias[0] = 0;
+      ;
    }
 
    tex_ext = get_tex_inst_ext(inst);
+
+   const char *bias = bias_buf.buf;
+   const char *offset = offset_buf.buf;
 
    if (inst->Texture.NumOffsets == 1) {
       if (inst->TexOffsets[0].Index >= (int)ARRAY_SIZE(ctx->imm)) {
          vrend_printf( "Immediate exceeded, max is %lu\n", ARRAY_SIZE(ctx->imm));
          set_buf_error(&ctx->glsl_strbufs);
-         return;
+         goto cleanup;
       }
 
-      if (!fill_offset_buffer(ctx, inst, offbuf)) {
+      if (!fill_offset_buffer(ctx, inst, &offset_buf)) {
          set_buf_error(&ctx->glsl_strbufs);
-         return;
+         goto cleanup;
       }
 
       if (inst->Instruction.Opcode == TGSI_OPCODE_TXL || inst->Instruction.Opcode == TGSI_OPCODE_TXL2 || inst->Instruction.Opcode == TGSI_OPCODE_TXD || (inst->Instruction.Opcode == TGSI_OPCODE_TG4 && is_shad)) {
-         char tmp[256];
-         strcpy(tmp, offbuf);
-         strcpy(offbuf, bias);
-         strcpy(bias, tmp);
+         offset = bias_buf.buf;
+         bias = offset_buf.buf;
       }
    }
 
-   /* On GLES we have to normalized the coordinate for all but the texel fetch instruction */
-   if (ctx->cfg->use_gles &&
-       inst->Instruction.Opcode != TGSI_OPCODE_TXF &&
-       (inst->Texture.Texture == TGSI_TEXTURE_RECT ||
-        inst->Texture.Texture == TGSI_TEXTURE_SHADOWRECT)) {
+   /* We have to unnormalize the coordinate for all but the texel fetch instruction */
+   if (inst->Instruction.Opcode != TGSI_OPCODE_TXF &&
+       vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_emulated_rect_mask, sinfo->sreg_index)) {
 
       char buf[255];
+      const char *bias = "";
       const char *new_srcs[4] = { buf, srcs[1], srcs[2], srcs[3] };
+
+      /* No LOD for these texture types, but on GLES we emulate RECT by using
+       * a normal 2D texture, so we have to give LOD 0 */
+      switch (inst->Texture.Texture) {
+      case TGSI_TEXTURE_BUFFER:
+      case TGSI_TEXTURE_2D_MSAA:
+      case TGSI_TEXTURE_2D_ARRAY_MSAA:
+         break;
+      case TGSI_TEXTURE_RECT:
+      case TGSI_TEXTURE_SHADOWRECT:
+         if (!ctx->cfg->use_gles)
+            break;
+         /* fallthrough */
+      default:
+         bias = ", 0";
+      }
 
       switch (inst->Instruction.Opcode) {
       case TGSI_OPCODE_TXP:
-         snprintf(buf, 255, "vec4(%s)/vec4(textureSize(%s, 0), 1, 1)", srcs[0], srcs[sampler_index]);
+         snprintf(buf, 255, "vec4(%s)/vec4(textureSize(%s%s), 1, 1)", srcs[0], srcs[sampler_index], bias);
          break;
 
       case TGSI_OPCODE_TG4:
-         snprintf(buf, 255, "%s.xy/vec2(textureSize(%s, 0))", srcs[0], srcs[sampler_index]);
+         snprintf(buf, 255, "%s.xy/vec2(textureSize(%s%s))", srcs[0], srcs[sampler_index], bias);
          break;
 
       default:
          /* Non TG4 ops have the compare value in the z components */
          if (inst->Texture.Texture == TGSI_TEXTURE_SHADOWRECT) {
-            snprintf(buf, 255, "vec3(%s.xy/vec2(textureSize(%s, 0)), %s.z)", srcs[0], srcs[sampler_index], srcs[0]);
+            snprintf(buf, 255, "vec3(%s.xy/vec2(textureSize(%s%s)), %s.z)", srcs[0], srcs[sampler_index], bias, srcs[0]);
          } else
-            snprintf(buf, 255, "%s.xy/vec2(textureSize(%s, 0))", srcs[0], srcs[sampler_index]);
+            snprintf(buf, 255, "%s.xy/vec2(textureSize(%s%s))", srcs[0], srcs[sampler_index], bias);
       }
       srcs = new_srcs;
    }
@@ -2766,30 +3131,63 @@ static void translate_tex(struct dump_ctx *ctx,
             emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texelFetch%s(%s, ivec2(%s(%s%s), 0)%s%s)%s));\n",
                       dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                       tex_ext, srcs[sampler_index], get_string(txfi), srcs[0],
-                      get_wm_string(twm), bias, offbuf,
+                      get_wm_string(twm), bias, offset,
                       dinfo->dst_override_no_wm[0] ? "" : writemask);
          else if (inst->Texture.Texture == TGSI_TEXTURE_1D_ARRAY) {
             /* the y coordinate must go into the z element and the y must be zero */
             emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texelFetch%s(%s, ivec3(%s(%s%s), 0).xzy%s%s)%s));\n",
                       dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                       tex_ext, srcs[sampler_index], get_string(txfi), srcs[0],
-                      get_wm_string(twm), bias, offbuf,
+                      get_wm_string(twm), bias, offset,
                       dinfo->dst_override_no_wm[0] ? "" : writemask);
          } else {
             emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texelFetch%s(%s, %s(%s%s), 0%s)%s));\n",
                       dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                       tex_ext, srcs[sampler_index], get_string(txfi), srcs[0],
-                      get_wm_string(twm), offbuf,
+                      get_wm_string(twm), offset,
                       dinfo->dst_override_no_wm[0] ? "" : writemask);
          }
       } else {
-         emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texelFetch%s(%s, %s(%s%s)%s%s)%s));\n",
-                   dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
+
+         /* To inject the swizzle for texturebufffers with emulated formats do
+          *
+          * {
+          *    vec4 val = texelFetch( )
+          *    val = vec4(0/1/swizzle_x, ...);
+          *    dest.writemask = val.writemask;
+          * }
+          *
+          */
+         emit_buff(&ctx->glsl_strbufs, "{\n  vec4 val = %s(texelFetch%s(%s, %s(%s%s)%s%s));\n",
+                   get_string(dtypeprefix),
                    tex_ext, srcs[sampler_index], get_string(txfi), srcs[0],
-                   get_wm_string(twm), bias, offbuf,
-                   dinfo->dst_override_no_wm[0] ? "" : writemask);
+                   get_wm_string(twm), bias, offset);
+
+         if (vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_lower_swizzle_mask, sinfo->sreg_index)) {
+            int16_t  packed_swizzles = ctx->key->tex_swizzle[sinfo->sreg_index];
+            emit_buff(&ctx->glsl_strbufs,  "   val = vec4(");
+
+            for (int i = 0; i < 4; ++i) {
+               if (i > 0)
+                  emit_buff(&ctx->glsl_strbufs,  ", ");
+
+               int swz = (packed_swizzles >> (i * 3)) & 7;
+               switch (swz) {
+               case PIPE_SWIZZLE_ZERO : emit_buf(&ctx->glsl_strbufs,  "0.0"); break;
+               case PIPE_SWIZZLE_ONE : emit_buf(&ctx->glsl_strbufs,  "1.0"); break;
+               default:
+                  emit_buff(&ctx->glsl_strbufs,  "val%s", get_swizzle_string(swz));
+               }
+            }
+
+            emit_buff(&ctx->glsl_strbufs,  ");\n");
+         }
+
+         emit_buff(&ctx->glsl_strbufs, "  %s  = val%s;\n}\n",
+                   dst, dinfo->dst_override_no_wm[0] ? "" : writemask);
       }
-   } else if (ctx->cfg->glsl_version < 140 && (ctx->shader_req_bits & SHADER_REQ_SAMPLER_RECT)) {
+   } else if ((ctx->cfg->glsl_version < 140 && (ctx->shader_req_bits & SHADER_REQ_SAMPLER_RECT)) &&
+              !vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_emulated_rect_mask, sinfo->sreg_index)) {
       /* rect is special in GLSL 1.30 */
       if (inst->Texture.Texture == TGSI_TEXTURE_RECT)
          emit_buff(&ctx->glsl_strbufs, "%s = texture2DRect(%s, %s.xy)%s;\n",
@@ -2809,21 +3207,21 @@ static void translate_tex(struct dump_ctx *ctx,
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(vec4(vec4(texture%s(%s, vec4(%s%s.xzw, 0).xwyz %s%s)) * %sshadmask%d + %sshadadd%d)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], get_wm_string(twm), offbuf, bias, cname,
+                         srcs[0], get_wm_string(twm), offset, bias, cname,
                          src->Register.Index, cname,
                          src->Register.Index, writemask);
             else
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(vec4(vec4(texture%s(%s, vec3(%s%s.xz, 0).xzy %s%s)) * %sshadmask%d + %sshadadd%d)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], get_wm_string(twm), offbuf, bias, cname,
+                         srcs[0], get_wm_string(twm), offset, bias, cname,
                          src->Register.Index, cname,
                          src->Register.Index, writemask);
          } else if (inst->Texture.Texture == TGSI_TEXTURE_SHADOW1D_ARRAY) {
             emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(vec4(vec4(texture%s(%s, vec4(%s%s, 0).xwyz %s%s)) * %sshadmask%d + %sshadadd%d)%s));\n",
                       dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                       tex_ext, srcs[sampler_index], srcs[0],
-                      get_wm_string(twm), offbuf, bias, cname,
+                      get_wm_string(twm), offset, bias, cname,
                       src->Register.Index, cname,
                       src->Register.Index, writemask);
          }
@@ -2831,7 +3229,7 @@ static void translate_tex(struct dump_ctx *ctx,
          emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(vec4(vec4(texture%s(%s, %s%s%s%s)) * %sshadmask%d + %sshadadd%d)%s));\n",
                    dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                    tex_ext, srcs[sampler_index], srcs[0],
-                   get_wm_string(twm), offbuf, bias, cname,
+                   get_wm_string(twm), offset, bias, cname,
                    src->Register.Index, cname,
                    src->Register.Index, writemask);
    } else {
@@ -2846,35 +3244,39 @@ static void translate_tex(struct dump_ctx *ctx,
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texture%s(%s, vec3(%s.xw, 0).xzy %s%s)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], offbuf, bias,
+                         srcs[0], offset, bias,
                          dinfo->dst_override_no_wm[0] ? "" : writemask);
             else
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texture%s(%s, vec2(%s%s, 0.5) %s%s)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], get_wm_string(twm), offbuf, bias,
+                         srcs[0], get_wm_string(twm), offset, bias,
                          dinfo->dst_override_no_wm[0] ? "" : writemask);
          } else if (inst->Texture.Texture == TGSI_TEXTURE_1D_ARRAY) {
             if (inst->Instruction.Opcode == TGSI_OPCODE_TXP)
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texture%s(%s, vec3(%s.x / %s.w, 0, %s.y) %s%s)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], srcs[0], srcs[0], offbuf, bias,
+                         srcs[0], srcs[0], srcs[0], offset, bias,
                          dinfo->dst_override_no_wm[0] ? "" : writemask);
             else
                emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texture%s(%s, vec3(%s%s, 0).xzy %s%s)%s));\n",
                          dst, get_string(dinfo->dstconv),
                          get_string(dtypeprefix), tex_ext, srcs[sampler_index],
-                         srcs[0], get_wm_string(twm), offbuf, bias,
+                         srcs[0], get_wm_string(twm), offset, bias,
                          dinfo->dst_override_no_wm[0] ? "" : writemask);
          }
       } else {
          emit_buff(&ctx->glsl_strbufs, "%s = %s(%s(texture%s(%s, %s%s%s%s)%s));\n",
                    dst, get_string(dinfo->dstconv), get_string(dtypeprefix),
                    tex_ext, srcs[sampler_index], srcs[0], get_wm_string(twm),
-                   offbuf, bias, dinfo->dst_override_no_wm[0] ? "" : writemask);
+                   offset, bias, dinfo->dst_override_no_wm[0] ? "" : writemask);
       }
    }
+
+cleanup:
+   strbuf_free(&offset_buf);
+   strbuf_free(&bias_buf);
 }
 
 static void
@@ -2887,14 +3289,22 @@ create_swizzled_clipdist(const struct dump_ctx *ctx,
                          const char *prefix,
                          const char *arrayname, int offset)
 {
-   char clipdistvec[4][64] = { 0, };
+   char clipdistvec[4][80] = { 0, };
 
    char clip_indirect[32] = "";
 
-   bool has_prev_vals = (ctx->key->prev_stage_num_cull_out + ctx->key->prev_stage_num_clip_out) > 0;
-   int num_culls = has_prev_vals ? ctx->key->prev_stage_num_cull_out : 0;
-   int num_clips = has_prev_vals ? ctx->key->prev_stage_num_clip_out : ctx->num_in_clip_dist;
+   bool has_prop = (ctx->num_cull_dist_prop + ctx->num_clip_dist_prop) > 0;
+   int num_culls = has_prop ? ctx->num_cull_dist_prop : ctx->key->num_out_cull;
+   int num_clips = has_prop ? ctx->num_clip_dist_prop : ctx->key->num_out_clip;
+
+   int num_clip_cull = num_culls + num_clips;
+   if (ctx->num_in_clip_dist && !num_clip_cull)
+      num_clips = ctx->num_in_clip_dist;
+
    int base_idx = ctx->inputs[input_idx].sid * 4;
+
+   // This doesn't work for indirect adressing
+   int base_offset = (src->Register.Index - offset) * 4;
 
    /* With arrays enabled , but only when gl_ClipDistance or gl_CullDistance are emitted (>4)
     * then we need to add indirect addressing */
@@ -2916,22 +3326,16 @@ create_swizzled_clipdist(const struct dump_ctx *ctx,
          idx += src->Register.SwizzleW;
 
       if (num_culls) {
-         if (idx >= num_clips) {
+         if (idx + base_offset >= num_clips) {
             idx -= num_clips;
             cc_name = "gl_CullDistance";
          }
-         if (ctx->key->prev_stage_num_cull_out)
-            if (idx >= ctx->key->prev_stage_num_cull_out)
-               idx = 0;
-      } else {
-         if (ctx->key->prev_stage_num_clip_out)
-            if (idx >= ctx->key->prev_stage_num_clip_out)
-               idx = 0;
       }
+
       if (gl_in)
-         snprintf(clipdistvec[cc], 64, "%sgl_in%s.%s[%s %d]", prefix, arrayname, cc_name, clip_indirect,  idx);
+         snprintf(clipdistvec[cc], 80, "%sgl_in%s.%s[%s %d]", prefix, arrayname, cc_name, clip_indirect,  idx);
       else
-         snprintf(clipdistvec[cc], 64, "%s%s%s[%s %d]", prefix, arrayname, cc_name, clip_indirect, idx);
+         snprintf(clipdistvec[cc], 80, "%s%s%s[%s %d]", prefix, arrayname, cc_name, clip_indirect, idx);
    }
    strbuf_fmt(result, "%s(vec4(%s,%s,%s,%s))", stypeprefix, clipdistvec[0], clipdistvec[1], clipdistvec[2], clipdistvec[3]);
 }
@@ -2947,6 +3351,14 @@ void load_clipdist_fs(const struct dump_ctx *ctx,
 {
    char clip_indirect[32] = "";
 
+   char swz[5] = {
+      get_swiz_char(src->Register.SwizzleX),
+      get_swiz_char(src->Register.SwizzleY),
+      get_swiz_char(src->Register.SwizzleZ),
+      get_swiz_char(src->Register.SwizzleW),
+      0
+   };
+
    int base_idx = ctx->inputs[input_idx].sid;
 
    /* With arrays enabled , but only when gl_ClipDistance or gl_CullDistance are emitted (>4)
@@ -2957,9 +3369,9 @@ void load_clipdist_fs(const struct dump_ctx *ctx,
       snprintf(clip_indirect, 32, "%d + %d", src->Register.Index - offset, base_idx);
 
    if (gl_in)
-      strbuf_fmt(result, "%s(clip_dist_temp[%s])", stypeprefix, clip_indirect);
+      strbuf_fmt(result, "%s(clip_dist_temp[%s].%s)", stypeprefix, clip_indirect, swz);
    else
-      strbuf_fmt(result, "%s(clip_dist_temp[%s])", stypeprefix, clip_indirect);
+      strbuf_fmt(result, "%s(clip_dist_temp[%s].%s)", stypeprefix, clip_indirect, swz);
 }
 
 
@@ -3432,6 +3844,9 @@ translate_atomic(struct dump_ctx *ctx,
 	 stypeprefix = FLOAT_BITS_TO_UINT;
       }
 
+      if (is_cas)
+         snprintf(cas_str, sizeof(cas_str), ", %s(%s(%s))", get_string(type), get_string(stypeprefix), srcs[3]);
+
       emit_buff(&ctx->glsl_strbufs, "%s = %s(atomic%s(%s[int(floatBitsToInt(%s)) >> 2], %s(%s(%s).x)%s));\n",
                 dst, get_string(dtypeprefix), opname, srcs[0], srcs[1],
                 get_string(type), get_string(stypeprefix), srcs[2], cas_str);
@@ -3456,11 +3871,11 @@ static const char *reswizzle_dest(const struct vrend_shader_io *io, const struct
 {
    if (io->usage_mask != 0xf) {
       if (io->num_components > 1) {
-         int real_wm = dst_reg->Register.WriteMask >> io->swizzle_offset;
+         const int wm = dst_reg->Register.WriteMask;
          int k = 1;
          reswizzled[0] = '.';
          for (int i = 0; i < io->num_components; ++i) {
-            if (real_wm & (1 << i))
+            if (wm & (1 << i))
                reswizzled[k++] = get_swiz_char(i);
          }
          reswizzled[k] = 0;
@@ -3473,37 +3888,41 @@ static const char *reswizzle_dest(const struct vrend_shader_io *io, const struct
 static void get_destination_info_generic(const struct dump_ctx *ctx,
                                          const struct tgsi_full_dst_register *dst_reg,
                                          const struct vrend_shader_io *io,
-                                         const char *writemask, char dsts[255])
+                                         const char *writemask,
+                                         struct vrend_strbuf *result)
 {
    const char *blkarray = (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL) ? "[gl_InvocationID]" : "";
    const char *stage_prefix = get_stage_output_name_prefix(ctx->prog_type);
    const char *wm = io->override_no_wm ? "" : writemask;
    char reswizzled[6] = "";
+   char outvarname[64];
 
    wm = reswizzle_dest(io, dst_reg, reswizzled, writemask);
 
-   if (io->first == io->last)
-      snprintf(dsts, 255, "%s%s%s", io->glsl_name, blkarray, wm);
-   else {
-      if (prefer_generic_io_block(ctx, io_out)) {
-         char outvarname[64];
-         get_blockvarname(outvarname, stage_prefix,  io, blkarray);
+   strbuf_reset(result);
 
-         if (dst_reg->Register.Indirect)
-            snprintf(dsts, 255, "%s.%s[addr%d + %d]%s",  outvarname, io->glsl_name,
-                     dst_reg->Indirect.Index, dst_reg->Register.Index - io->first, wm);
-         else
-            snprintf(dsts, 255, "%s.%s[%d]%s",  outvarname, io->glsl_name,
-                     dst_reg->Register.Index - io->first, wm);
-      } else {
-         if (dst_reg->Register.Indirect)
-            snprintf(dsts, 255, "%s%s[addr%d + %d]%s",  io->glsl_name, blkarray,
-                     dst_reg->Indirect.Index, dst_reg->Register.Index - io->first, wm);
-         else
-            snprintf(dsts, 255, "%s%s[%d]%s", io->glsl_name, blkarray,
-                     dst_reg->Register.Index - io->first, wm);
+   enum io_decl_type decl_type = decl_plain;
+   if (io->first != io->last && prefer_generic_io_block(ctx, io_out)) {
+      get_blockvarname(outvarname, stage_prefix,  io, blkarray);
+      blkarray = outvarname;
+      decl_type = decl_block;
+   }
+   vrend_shader_write_io_as_dst(result, blkarray, io, dst_reg, decl_type);
+   strbuf_appendf(result, "%s", wm);
+}
+
+static
+int find_io_index(int num_io, struct vrend_shader_io *io,
+                  int index, uint32_t usage_mask)
+{
+   for (int j = 0; j < num_io; j++) {
+      if (io[j].first <= index &&
+          io[j].last >= index &&
+          (io[j].usage_mask & usage_mask)) {
+         return j;
       }
    }
+   return -1;
 }
 
 // TODO Consider exposing non-const ctx-> members as args to make *ctx const
@@ -3511,7 +3930,7 @@ static bool
 get_destination_info(struct dump_ctx *ctx,
                      const struct tgsi_full_instruction *inst,
                      struct dest_info *dinfo,
-                     char dsts[3][255],
+                     struct vrend_strbuf dst_bufs[3],
                      char fp64_dsts[3][255],
                      char *writemask)
 {
@@ -3586,104 +4005,101 @@ get_destination_info(struct dump_ctx *ctx,
       }
 
       if (dst_reg->Register.File == TGSI_FILE_OUTPUT) {
-         uint32_t j;
-         for (j = 0; j < ctx->num_outputs; j++) {
-            if (ctx->outputs[j].first <= dst_reg->Register.Index &&
-                ctx->outputs[j].last >= dst_reg->Register.Index &&
-                (ctx->outputs[j].usage_mask & dst_reg->Register.WriteMask)) {
-               if (inst->Instruction.Precise) {
-                  if (!ctx->outputs[j].invariant && ctx->outputs[j].name != TGSI_SEMANTIC_CLIPVERTEX) {
-                     ctx->outputs[j].precise = true;
-                     ctx->shader_req_bits |= SHADER_REQ_GPU_SHADER5;
-                  }
-               }
+         int j = find_io_index(ctx->num_outputs, ctx->outputs,
+                               dst_reg->Register.Index, dst_reg->Register.WriteMask);
 
-               if (ctx->glsl_ver_required >= 140 && ctx->outputs[j].name == TGSI_SEMANTIC_CLIPVERTEX) {
-                  snprintf(dsts[i], 255, "clipv_tmp");
-               } else if (ctx->outputs[j].name == TGSI_SEMANTIC_CLIPDIST) {
-                  char clip_indirect[32] = "";
-                  if (ctx->outputs[j].first != ctx->outputs[j].last) {
-                     if (dst_reg->Register.Indirect)
-                        snprintf(clip_indirect, sizeof(clip_indirect), "+ addr%d", dst_reg->Indirect.Index);
-                     else
-                        snprintf(clip_indirect, sizeof(clip_indirect), "+ %d", dst_reg->Register.Index - ctx->outputs[j].first);
-                  }
-                  snprintf(dsts[i], 255, "clip_dist_temp[%d %s]", ctx->outputs[j].sid, clip_indirect);
-               } else if (ctx->outputs[j].name == TGSI_SEMANTIC_TESSOUTER ||
-                          ctx->outputs[j].name == TGSI_SEMANTIC_TESSINNER ||
-                          ctx->outputs[j].name == TGSI_SEMANTIC_SAMPLEMASK) {
-                  int idx;
-                  switch (dst_reg->Register.WriteMask) {
-                  case 0x1: idx = 0; break;
-                  case 0x2: idx = 1; break;
-                  case 0x4: idx = 2; break;
-                  case 0x8: idx = 3; break;
-                  default:
-                     idx = 0;
-                     break;
-                  }
-                  snprintf(dsts[i], 255, "%s[%d]", ctx->outputs[j].glsl_name, idx);
-                  if (ctx->outputs[j].is_int) {
-                     dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
-                     dinfo->dstconv = INT;
-                  }
+         if (j < 0)
+            return false;
+
+         struct vrend_shader_io *output = &ctx->outputs[j];
+
+         if (inst->Instruction.Precise) {
+            if (!output->invariant && output->name != TGSI_SEMANTIC_CLIPVERTEX) {
+               output->precise = true;
+               ctx->shader_req_bits |= SHADER_REQ_GPU_SHADER5;
+            }
+         }
+
+         if (ctx->glsl_ver_required >= 140 && output->name == TGSI_SEMANTIC_CLIPVERTEX) {
+            if (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL) {
+               strbuf_fmt(&dst_bufs[i], "%s[gl_InvocationID]", output->glsl_name);
+            } else {
+               strbuf_fmt(&dst_bufs[i], "%s", ctx->is_last_vertex_stage ? "clipv_tmp" : output->glsl_name);
+            }
+         } else if (output->name == TGSI_SEMANTIC_CLIPDIST) {
+            char clip_indirect[32] = "";
+            if (output->first != output->last) {
+               if (dst_reg->Register.Indirect)
+                  snprintf(clip_indirect, sizeof(clip_indirect), "+ addr%d", dst_reg->Indirect.Index);
+               else
+                  snprintf(clip_indirect, sizeof(clip_indirect), "+ %d", dst_reg->Register.Index - output->first);
+            }
+            strbuf_fmt(&dst_bufs[i], "clip_dist_temp[%d %s]%s", output->sid, clip_indirect, writemask);
+         } else if (output->name == TGSI_SEMANTIC_TESSOUTER ||
+                    output->name == TGSI_SEMANTIC_TESSINNER ||
+                    output->name == TGSI_SEMANTIC_SAMPLEMASK) {
+            int idx;
+            switch (dst_reg->Register.WriteMask) {
+            case 0x1: idx = 0; break;
+            case 0x2: idx = 1; break;
+            case 0x4: idx = 2; break;
+            case 0x8: idx = 3; break;
+            default:
+               idx = 0;
+               break;
+            }
+            strbuf_fmt(&dst_bufs[i], "%s[%d]", output->glsl_name, idx);
+            if (output->is_int) {
+               dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
+               dinfo->dstconv = INT;
+            }
+         } else {
+            if (output->glsl_gl_block) {
+               strbuf_fmt(&dst_bufs[i], "gl_out[%s].%s%s",
+                          ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL ? "gl_InvocationID" : "0",
+                          output->glsl_name,
+                          output->override_no_wm ? "" : writemask);
+            } else if (output->name == TGSI_SEMANTIC_GENERIC) {
+               struct vrend_shader_io *io = ctx->generic_ios.output_range.used ? &ctx->generic_ios.output_range.io : output;
+               get_destination_info_generic(ctx, dst_reg, io, writemask, &dst_bufs[i]);
+               dinfo->dst_override_no_wm[i] = output->override_no_wm;
+            } else if (output->name == TGSI_SEMANTIC_TEXCOORD) {
+               get_destination_info_generic(ctx, dst_reg, output, writemask, &dst_bufs[i]);
+               dinfo->dst_override_no_wm[i] = output->override_no_wm;
+            } else if (output->name == TGSI_SEMANTIC_PATCH) {
+               struct vrend_shader_io *io = ctx->patch_ios.output_range.used ? &ctx->patch_ios.output_range.io : output;
+               char reswizzled[6] = "";
+               const char *wm = reswizzle_dest(io, dst_reg, reswizzled, writemask);
+               strbuf_reset(&dst_bufs[i]);
+               vrend_shader_write_io_as_dst(&dst_bufs[i], "", io, dst_reg, decl_plain);
+               if (!output->override_no_wm)
+                  strbuf_appendf(&dst_bufs[i], "%s", wm);
+               dinfo->dst_override_no_wm[i] = output->override_no_wm;
+            } else {
+               if (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL) {
+                  strbuf_fmt(&dst_bufs[i], "%s[gl_InvocationID]%s", output->glsl_name, output->override_no_wm ? "" : writemask);
                } else {
-                  if (ctx->outputs[j].glsl_gl_block) {
-                     snprintf(dsts[i], 255, "gl_out[%s].%s%s",
-                              ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL ? "gl_InvocationID" : "0",
-                              ctx->outputs[j].glsl_name,
-                              ctx->outputs[j].override_no_wm ? "" : writemask);
-                  } else if (ctx->outputs[j].name == TGSI_SEMANTIC_GENERIC) {
-                     struct vrend_shader_io *io = ctx->generic_ios.output_range.used ? &ctx->generic_ios.output_range.io : &ctx->outputs[j];
-                     get_destination_info_generic(ctx, dst_reg, io, writemask, dsts[i]);
-                     dinfo->dst_override_no_wm[i] = ctx->outputs[j].override_no_wm;
-                  } else if (ctx->outputs[j].name == TGSI_SEMANTIC_PATCH) {
-                     struct vrend_shader_io *io = ctx->patch_ios.output_range.used ? &ctx->patch_ios.output_range.io : &ctx->outputs[j];
-                     char reswizzled[6] = "";
-                     const char *wm = reswizzle_dest(io, dst_reg, reswizzled, writemask);
-                     if (io->last != io->first) {
-                        if (dst_reg->Register.Indirect)
-                           snprintf(dsts[i], 255, "%s[addr%d + %d]%s",
-                                    io->glsl_name,                                     dst_reg->Indirect.Index,
-                                    dst_reg->Register.Index - io->first,
-                                    io->override_no_wm ? "" : wm);
-                        else
-                           snprintf(dsts[i], 255, "%s[%d]%s",
-                                    io->glsl_name,
-                                    dst_reg->Register.Index - io->first,
-                                    io->override_no_wm ? "" : wm);
-                     } else {
-                           snprintf(dsts[i], 255, "%s%s", io->glsl_name, ctx->outputs[j].override_no_wm ? "" : wm);
-                     }
-                     dinfo->dst_override_no_wm[i] = ctx->outputs[j].override_no_wm;
-                  } else {
-                     if (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL) {
-                        snprintf(dsts[i], 255, "%s[gl_InvocationID]%s", ctx->outputs[j].glsl_name, ctx->outputs[j].override_no_wm ? "" : writemask);
-                     } else {
-                        snprintf(dsts[i], 255, "%s%s", ctx->outputs[j].glsl_name, ctx->outputs[j].override_no_wm ? "" : writemask);
-                     }
-                     dinfo->dst_override_no_wm[i] = ctx->outputs[j].override_no_wm;
-                  }
-                  if (ctx->outputs[j].is_int) {
-                     if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
-                        dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
-                     dinfo->dstconv = INT;
-                  }
-                  else if (ctx->outputs[j].type == VEC_UINT) {
-                     if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
-                        dinfo->dtypeprefix = FLOAT_BITS_TO_UINT;
-                     dinfo->dstconv = dinfo->udstconv;
-                  }
-                  else if (ctx->outputs[j].type == VEC_INT) {
-                     if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
-                        dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
-                     dinfo->dstconv = dinfo->idstconv;
-                  }
-                  if (ctx->outputs[j].name == TGSI_SEMANTIC_PSIZE) {
-                     dinfo->dstconv = FLOAT;
-                     break;
-                  }
+                  strbuf_fmt(&dst_bufs[i], "%s%s", output->glsl_name, output->override_no_wm ? "" : writemask);
                }
+               dinfo->dst_override_no_wm[i] = output->override_no_wm;
+            }
+            if (output->is_int) {
+               if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
+                  dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
+               dinfo->dstconv = INT;
+            }
+            else if (output->type == VEC_UINT) {
+               if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
+                  dinfo->dtypeprefix = FLOAT_BITS_TO_UINT;
+               dinfo->dstconv = dinfo->udstconv;
+            }
+            else if (output->type == VEC_INT) {
+               if (dinfo->dtypeprefix == TYPE_CONVERSION_NONE)
+                  dinfo->dtypeprefix = FLOAT_BITS_TO_INT;
+               dinfo->dstconv = dinfo->idstconv;
+            }
+            if (output->name == TGSI_SEMANTIC_PSIZE) {
+               dinfo->dstconv = FLOAT;
                break;
             }
          }
@@ -3693,9 +4109,9 @@ get_destination_info(struct dump_ctx *ctx,
          if (!range)
             return false;
          if (dst_reg->Register.Indirect) {
-            snprintf(dsts[i], 255, "temp%d[addr0 + %d]%s", range->first, dst_reg->Register.Index - range->first, writemask);
+            strbuf_fmt(&dst_bufs[i], "temp%d[addr0 + %d]%s", range->first, dst_reg->Register.Index - range->first, writemask);
          } else
-            snprintf(dsts[i], 255, "temp%d[%d]%s", range->first, dst_reg->Register.Index - range->first, writemask);
+            strbuf_fmt(&dst_bufs[i], "temp%d[%d]%s", range->first, dst_reg->Register.Index - range->first, writemask);
       }
       else if (dst_reg->Register.File == TGSI_FILE_IMAGE) {
          const char *cname = tgsi_proc_to_prefix(ctx->prog_type);
@@ -3703,11 +4119,11 @@ get_destination_info(struct dump_ctx *ctx,
             int basearrayidx = lookup_image_array(ctx, dst_reg->Register.Index);
             if (dst_reg->Register.Indirect) {
                assert(dst_reg->Indirect.File == TGSI_FILE_ADDRESS);
-               snprintf(dsts[i], 255, "%simg%d[addr%d + %d]", cname, basearrayidx, dst_reg->Indirect.Index, dst_reg->Register.Index - basearrayidx);
+               strbuf_fmt(&dst_bufs[i], "%simg%d[addr%d + %d]", cname, basearrayidx, dst_reg->Indirect.Index, dst_reg->Register.Index - basearrayidx);
             } else
-               snprintf(dsts[i], 255, "%simg%d[%d]", cname, basearrayidx, dst_reg->Register.Index - basearrayidx);
+               strbuf_fmt(&dst_bufs[i], "%simg%d[%d]", cname, basearrayidx, dst_reg->Register.Index - basearrayidx);
          } else
-            snprintf(dsts[i], 255, "%simg%d", cname, dst_reg->Register.Index);
+            strbuf_fmt(&dst_bufs[i], "%simg%d", cname, dst_reg->Register.Index);
       } else if (dst_reg->Register.File == TGSI_FILE_BUFFER) {
          const char *cname = tgsi_proc_to_prefix(ctx->prog_type);
          if (ctx->info.indirect_files & (1 << TGSI_FILE_BUFFER)) {
@@ -3715,20 +4131,20 @@ get_destination_info(struct dump_ctx *ctx,
             const char *atomic_str = atomic_ssbo ? "atomic" : "";
             int base = atomic_ssbo ? ctx->ssbo_atomic_array_base : ctx->ssbo_array_base;
             if (dst_reg->Register.Indirect) {
-               snprintf(dsts[i], 255, "%sssboarr%s[addr%d+%d].%sssbocontents%d", cname, atomic_str, dst_reg->Indirect.Index, dst_reg->Register.Index - base, cname, base);
+               strbuf_fmt(&dst_bufs[i], "%sssboarr%s[addr%d+%d].%sssbocontents%d", cname, atomic_str, dst_reg->Indirect.Index, dst_reg->Register.Index - base, cname, base);
             } else
-               snprintf(dsts[i], 255, "%sssboarr%s[%d].%sssbocontents%d", cname, atomic_str, dst_reg->Register.Index - base, cname, base);
+               strbuf_fmt(&dst_bufs[i], "%sssboarr%s[%d].%sssbocontents%d", cname, atomic_str, dst_reg->Register.Index - base, cname, base);
          } else
-            snprintf(dsts[i], 255, "%sssbocontents%d", cname, dst_reg->Register.Index);
+            strbuf_fmt(&dst_bufs[i], "%sssbocontents%d", cname, dst_reg->Register.Index);
       } else if (dst_reg->Register.File == TGSI_FILE_MEMORY) {
-         snprintf(dsts[i], 255, "values");
+         strbuf_fmt(&dst_bufs[i], "values");
       } else if (dst_reg->Register.File == TGSI_FILE_ADDRESS) {
-         snprintf(dsts[i], 255, "addr%d", dst_reg->Register.Index);
+         strbuf_fmt(&dst_bufs[i], "addr%d", dst_reg->Register.Index);
       }
 
       if (dtype == TGSI_TYPE_DOUBLE) {
-         strcpy(fp64_dsts[i], dsts[i]);
-         snprintf(dsts[i], 255, "fp64_dst[%d]%s", i, fp64_writemask);
+         strcpy(fp64_dsts[i], dst_bufs[i].buf);
+         strbuf_fmt(&dst_bufs[i], "fp64_dst[%d]%s", i, fp64_writemask);
          writemask[0] = 0;
       }
 
@@ -3745,15 +4161,15 @@ static const char *shift_swizzles(const struct vrend_shader_io *io, const struct
          swizzle_shifted[swz_offset++] = '.';
          for (int i = 0; i < 4; ++i) {
             switch (i) {
-            case 0: swizzle_shifted[swz_offset++] = get_swiz_char(src->Register.SwizzleX - io->swizzle_offset);
+            case 0: swizzle_shifted[swz_offset++] = get_swiz_char(src->Register.SwizzleX);
                break;
-            case 1: swizzle_shifted[swz_offset++] = get_swiz_char(src->Register.SwizzleY - io->swizzle_offset);
+            case 1: swizzle_shifted[swz_offset++] = get_swiz_char(src->Register.SwizzleY);
                break;
-            case 2: swizzle_shifted[swz_offset++] = src->Register.SwizzleZ - io->swizzle_offset < io->num_components ?
-                                                       get_swiz_char(src->Register.SwizzleZ - io->swizzle_offset) : 'x';
+            case 2: swizzle_shifted[swz_offset++] = src->Register.SwizzleZ < io->num_components ?
+                                                       get_swiz_char(src->Register.SwizzleZ) : 'x';
                break;
-            case 3: swizzle_shifted[swz_offset++] = src->Register.SwizzleW - io->swizzle_offset < io->num_components ?
-                                                       get_swiz_char(src->Register.SwizzleW - io->swizzle_offset) : 'x';
+            case 3: swizzle_shifted[swz_offset++] = src->Register.SwizzleW < io->num_components ?
+                                                       get_swiz_char(src->Register.SwizzleW) : 'x';
             }
          }
          swizzle_shifted[swz_offset] = 0;
@@ -3775,6 +4191,8 @@ static void get_source_info_generic(const struct dump_ctx *ctx,
 {
    int swz_offset = 0;
    char swizzle_shifted[6] = "";
+   char outvarname[64];
+
    if (swizzle[0] == ')') {
       swizzle_shifted[swz_offset++] = ')';
       swizzle_shifted[swz_offset] = 0;
@@ -3783,42 +4201,20 @@ static void get_source_info_generic(const struct dump_ctx *ctx,
    /* This IO element is not using all vector elements, so we have to shift the swizzle names */
    swizzle = shift_swizzles(io, src, swz_offset, swizzle_shifted, swizzle);
 
-   if (io->first == io->last) {
-      strbuf_fmt(result, "%s(%s%s%s%s)", get_string(srcstypeprefix),
-               prefix, io->glsl_name, arrayname, io->is_int ? "" : swizzle);
-   } else {
+   strbuf_fmt(result, "%s(%s", get_string(srcstypeprefix), prefix);
 
-      if (prefer_generic_io_block(ctx, iot)) {
-         char outvarname[64];
-         const char *stage_prefix = iot == io_in ? get_stage_input_name_prefix(ctx, ctx->prog_type) :
-                                                   get_stage_output_name_prefix(ctx->prog_type);
+   enum io_decl_type decl_type = decl_plain;
 
-         get_blockvarname(outvarname, stage_prefix, io, arrayname);
-         if (src->Register.Indirect)
-            strbuf_fmt(result, "%s(%s %s.%s[addr%d + %d] %s)", get_string(srcstypeprefix), prefix,
-                     outvarname, io->glsl_name, src->Indirect.Index, src->Register.Index - io->first,
-                     io->is_int ? "" : swizzle);
-         else
-            strbuf_fmt(result, "%s(%s %s.%s[%d] %s)", get_string(srcstypeprefix), prefix,
-                     outvarname, io->glsl_name, src->Register.Index - io->first,
-                     io->is_int ? "" : swizzle);
-      } else {
-         if (src->Register.Indirect)
-            strbuf_fmt(result, "%s(%s %s%s[addr%d + %d] %s)", get_string(srcstypeprefix), prefix,
-                     io->glsl_name,
-                     arrayname,
-                     src->Indirect.Index,
-                     src->Register.Index - io->first,
-                     io->is_int ? "" : swizzle);
-         else
-            strbuf_fmt(result, "%s(%s %s%s[%d] %s)", get_string(srcstypeprefix), prefix,
-                     io->glsl_name,
-                     arrayname,
-                     src->Register.Index - io->first,
-                     io->is_int ? "" : swizzle);
-      }
-
+   if (io->first != io->last && prefer_generic_io_block(ctx, iot)) {
+      const char *stage_prefix = iot == io_in ? get_stage_input_name_prefix(ctx, ctx->prog_type) :
+                                                get_stage_output_name_prefix(ctx->prog_type);
+      get_blockvarname(outvarname, stage_prefix, io, arrayname);
+      arrayname = outvarname;
+      decl_type = decl_block;
    }
+
+   vrend_shader_write_io_as_src(result, arrayname, io, src, decl_type);
+   strbuf_appendf(result, "%s)", io->is_int ? "" : swizzle);
 }
 
 static void get_source_info_patch(enum vrend_type_qualifier srcstypeprefix,
@@ -3837,29 +4233,45 @@ static void get_source_info_patch(enum vrend_type_qualifier srcstypeprefix,
    }
 
    swizzle = shift_swizzles(io, src, swz_offset, swizzle_shifted, swizzle);
-   const char *wm = io->is_int ? "" : swizzle;
 
-   if (io->last == io->first)
-      strbuf_fmt(result, "%s(%s%s%s%s)", get_string(srcstypeprefix), prefix, io->glsl_name,
-               arrayname, wm);
-   else {
-      if (src->Register.Indirect)
-         strbuf_fmt(result, "%s(%s %s[addr%d + %d] %s)", get_string(srcstypeprefix), prefix,
-                  io->glsl_name, src->Indirect.Index, src->Register.Index - io->first, wm);
-      else
-         strbuf_fmt(result, "%s(%s %s[%d] %s)", get_string(srcstypeprefix), prefix,
-                  io->glsl_name, src->Register.Index - io->first, wm);
-   }
-
+   strbuf_fmt(result, "%s(%s", get_string(srcstypeprefix), prefix);
+   vrend_shader_write_io_as_src(result, io->last == io->first ? arrayname : "", io, src, decl_plain);
+   strbuf_appendf(result, "%s)", io->is_int ? "" : swizzle);
 }
 
+static void get_tesslevel_as_source(struct vrend_strbuf *src_buf, const char *prefix,
+                                    const char *name, const struct tgsi_src_register *reg)
+{
+   strbuf_fmt(src_buf, "%s(vec4(%s[%d], %s[%d], %s[%d], %s[%d]))",
+              prefix,
+              name, reg->SwizzleX,
+              name, reg->SwizzleY,
+              name, reg->SwizzleZ,
+              name, reg->SwizzleW);
+}
+
+static void get_source_swizzle(const struct tgsi_full_src_register *src, char swizzle[8])
+{
+   if (src->Register.SwizzleX != TGSI_SWIZZLE_X ||
+       src->Register.SwizzleY != TGSI_SWIZZLE_Y ||
+       src->Register.SwizzleZ != TGSI_SWIZZLE_Z ||
+       src->Register.SwizzleW != TGSI_SWIZZLE_W) {
+      *swizzle++ = '.';
+      *swizzle++ = get_swiz_char(src->Register.SwizzleX);
+      *swizzle++ = get_swiz_char(src->Register.SwizzleY);
+      *swizzle++ = get_swiz_char(src->Register.SwizzleZ);
+      *swizzle++ = get_swiz_char(src->Register.SwizzleW);
+   }
+
+   *swizzle++ = 0;
+}
 
 // TODO Consider exposing non-const ctx-> members as args to make *ctx const
 static bool
 get_source_info(struct dump_ctx *ctx,
                 const struct tgsi_full_instruction *inst,
                 struct source_info *sinfo,
-                struct vrend_strbuf srcs[4], char src_swizzle0[10])
+                struct vrend_strbuf srcs[4], char src_swizzle0[16])
 {
    bool stprefix = false;
 
@@ -3894,7 +4306,7 @@ get_source_info(struct dump_ctx *ctx,
    for (uint32_t i = 0; i < inst->Instruction.NumSrcRegs; i++) {
       const struct tgsi_full_src_register *src = &inst->Src[i];
       struct vrend_strbuf *src_buf = &srcs[i];
-      char swizzle[8] = "";
+      char swizzle[16] = "";
       int usage_mask = 0;
       char *swizzle_writer = swizzle;
       char prefix[6] = "";
@@ -3905,8 +4317,6 @@ get_source_info(struct dump_ctx *ctx,
 
       sinfo->override_no_wm[i] = false;
       sinfo->override_no_cast[i] = false;
-      if (isfloatabsolute)
-         swizzle[swz_idx++] = ')';
 
       if (src->Register.Negate)
          prefix[pre_idx++] = '-';
@@ -3930,122 +4340,133 @@ get_source_info(struct dump_ctx *ctx,
          swizzle_writer = src_swizzle0;
       }
 
+      if (isfloatabsolute)
+         swizzle_writer[swz_idx++] = ')';
+
       usage_mask |= 1 << src->Register.SwizzleX;
       usage_mask |= 1 << src->Register.SwizzleY;
       usage_mask |= 1 << src->Register.SwizzleZ;
       usage_mask |= 1 << src->Register.SwizzleW;
 
-      if (src->Register.SwizzleX != TGSI_SWIZZLE_X ||
-          src->Register.SwizzleY != TGSI_SWIZZLE_Y ||
-          src->Register.SwizzleZ != TGSI_SWIZZLE_Z ||
-          src->Register.SwizzleW != TGSI_SWIZZLE_W) {
-         swizzle_writer[swz_idx++] = '.';
-         swizzle_writer[swz_idx++] = get_swiz_char(src->Register.SwizzleX);
-         swizzle_writer[swz_idx++] = get_swiz_char(src->Register.SwizzleY);
-         swizzle_writer[swz_idx++] = get_swiz_char(src->Register.SwizzleZ);
-         swizzle_writer[swz_idx++] = get_swiz_char(src->Register.SwizzleW);
-      }
-      swizzle_writer[swz_idx] = 0;
+      get_source_swizzle(src, swizzle_writer + swz_idx);
 
       if (src->Register.File == TGSI_FILE_INPUT) {
-         for (uint32_t j = 0; j < ctx->num_inputs; j++)
-            if (ctx->inputs[j].first <= src->Register.Index &&
-                ctx->inputs[j].last >= src->Register.Index &&
-                (ctx->inputs[j].usage_mask & usage_mask)) {
-               if (ctx->key->color_two_side && ctx->inputs[j].name == TGSI_SEMANTIC_COLOR)
-                  strbuf_fmt(src_buf, "%s(%s%s%d%s%s)", get_string(stypeprefix), prefix, "realcolor", ctx->inputs[j].sid, arrayname, swizzle);
-               else if (ctx->inputs[j].glsl_gl_block) {
-                  /* GS input clipdist requires a conversion */
-                  if (ctx->inputs[j].name == TGSI_SEMANTIC_CLIPDIST) {
-                     create_swizzled_clipdist(ctx, src_buf, src, j, true, get_string(stypeprefix), prefix, arrayname, ctx->inputs[j].first);
-                  } else {
-                     strbuf_fmt(src_buf, "%s(vec4(%sgl_in%s.%s)%s)", get_string(stypeprefix), prefix, arrayname, ctx->inputs[j].glsl_name, swizzle);
-                  }
-               }
-               else if (ctx->inputs[j].name == TGSI_SEMANTIC_PRIMID)
-                  strbuf_fmt(src_buf, "%s(vec4(intBitsToFloat(%s)))", get_string(stypeprefix), ctx->inputs[j].glsl_name);
-               else if (ctx->inputs[j].name == TGSI_SEMANTIC_FACE)
-                  strbuf_fmt(src_buf, "%s(%s ? 1.0 : -1.0)", get_string(stypeprefix), ctx->inputs[j].glsl_name);
-               else if (ctx->inputs[j].name == TGSI_SEMANTIC_CLIPDIST) {
-                  if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT)
-                     load_clipdist_fs(ctx, src_buf, src, j, false, get_string(stypeprefix), ctx->inputs[j].first);
-                  else
-                     create_swizzled_clipdist(ctx, src_buf, src, j, false, get_string(stypeprefix), prefix, arrayname, ctx->inputs[j].first);
-               } else {
-                  enum vrend_type_qualifier srcstypeprefix = stypeprefix;
-                  if ((stype == TGSI_TYPE_UNSIGNED || stype == TGSI_TYPE_SIGNED) &&
-                      ctx->inputs[j].is_int)
-                     srcstypeprefix = TYPE_CONVERSION_NONE;
-                  else if (ctx->inputs[j].type) {
-                     if (stype == TGSI_TYPE_UNSIGNED)
-                        srcstypeprefix = UVEC4;
-                     else if (stype == TGSI_TYPE_SIGNED)
-                        srcstypeprefix = IVEC4;
-                     else if (ctx->inputs[j].type == VEC_INT)
-                        srcstypeprefix = INT_BITS_TO_FLOAT;
-                     else // ctx->inputs[j].type == VEC_UINT
-                        srcstypeprefix = UINT_BITS_TO_FLOAT;
-                  }
+         int j = find_io_index(ctx->num_inputs, ctx->inputs,
+                                  src->Register.Index, usage_mask);
+         if (j < 0)
+            return false;
 
-                  if (inst->Instruction.Opcode == TGSI_OPCODE_INTERP_SAMPLE && i == 1) {
-                     strbuf_fmt(src_buf, "floatBitsToInt(%s%s%s%s)", prefix, ctx->inputs[j].glsl_name, arrayname, swizzle);
-                  } else if (ctx->inputs[j].name == TGSI_SEMANTIC_GENERIC) {
-                     struct vrend_shader_io *io = ctx->generic_ios.input_range.used ? &ctx->generic_ios.input_range.io : &ctx->inputs[j];
-                     get_source_info_generic(ctx, io_in, srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
-                  } else if (ctx->inputs[j].name == TGSI_SEMANTIC_PATCH) {
-                     struct vrend_shader_io *io = ctx->patch_ios.input_range.used ? &ctx->patch_ios.input_range.io : &ctx->inputs[j];
-                     get_source_info_patch(srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
-                  } else if (ctx->inputs[j].name == TGSI_SEMANTIC_POSITION && ctx->prog_type == TGSI_PROCESSOR_VERTEX &&
-                             ctx->inputs[j].first != ctx->inputs[j].last) {
-                     if (src->Register.Indirect)
-                        strbuf_fmt(src_buf, "%s(%s%s%s[addr%d + %d]%s)", get_string(srcstypeprefix), prefix, ctx->inputs[j].glsl_name, arrayname,
-                                   src->Indirect.Index, src->Register.Index, ctx->inputs[j].is_int ? "" : swizzle);
-                     else
-                        strbuf_fmt(src_buf, "%s(%s%s%s[%d]%s)", get_string(srcstypeprefix), prefix, ctx->inputs[j].glsl_name, arrayname,
-                                   src->Register.Index, ctx->inputs[j].is_int ? "" : swizzle);
-                  } else
-                     strbuf_fmt(src_buf, "%s(%s%s%s%s)", get_string(srcstypeprefix), prefix, ctx->inputs[j].glsl_name, arrayname, ctx->inputs[j].is_int ? "" : swizzle);
-               }
-               sinfo->override_no_wm[i] = ctx->inputs[j].override_no_wm;
-               break;
+         struct vrend_shader_io *input = &ctx->inputs[j];
+
+         if (ctx->prog_type == TGSI_PROCESSOR_VERTEX) {
+            if (ctx->key->vs.attrib_zyxw_bitmask & (1 << input->first)) {
+               swizzle_writer[swz_idx++] = '.';
+               swizzle_writer[swz_idx++] = 'z';
+               swizzle_writer[swz_idx++] = 'y';
+               swizzle_writer[swz_idx++] = 'x';
+               swizzle_writer[swz_idx++] = 'w';
             }
-      } else if (src->Register.File == TGSI_FILE_OUTPUT) {
-         for (uint32_t j = 0; j < ctx->num_outputs; j++) {
-            if (ctx->outputs[j].first <= src->Register.Index &&
-                ctx->outputs[j].last >= src->Register.Index &&
-                (ctx->outputs[j].usage_mask & usage_mask)) {
-               if (inst->Instruction.Opcode == TGSI_OPCODE_FBFETCH) {
-                  ctx->outputs[j].fbfetch_used = true;
-                  ctx->shader_req_bits |= SHADER_REQ_FBFETCH;
-               }
+            get_source_swizzle(src, swizzle_writer + swz_idx);
+         }
 
-               enum vrend_type_qualifier srcstypeprefix = stypeprefix;
-               if (stype == TGSI_TYPE_UNSIGNED && ctx->outputs[j].is_int)
-                  srcstypeprefix = TYPE_CONVERSION_NONE;
-               if (ctx->outputs[j].glsl_gl_block) {
-                  if (ctx->outputs[j].name == TGSI_SEMANTIC_CLIPDIST) {
-                     char clip_indirect[32] = "";
-                     if (ctx->outputs[j].first != ctx->outputs[j].last) {
-                        if (src->Register.Indirect)
-                           snprintf(clip_indirect, sizeof(clip_indirect), "+ addr%d", src->Indirect.Index);
-                        else
-                           snprintf(clip_indirect, sizeof(clip_indirect), "+ %d", src->Register.Index - ctx->outputs[j].first);
-                     }
-                     strbuf_fmt(src_buf, "clip_dist_temp[%d%s]", ctx->outputs[j].sid, clip_indirect);
-                  }
-               } else if (ctx->outputs[j].name == TGSI_SEMANTIC_GENERIC) {
-                  struct vrend_shader_io *io = ctx->generic_ios.output_range.used ? &ctx->generic_ios.output_range.io : &ctx->outputs[j];
-                  get_source_info_generic(ctx, io_out, srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
-               } else if (ctx->outputs[j].name == TGSI_SEMANTIC_PATCH) {
-                  struct vrend_shader_io *io = ctx->patch_ios.output_range.used ? &ctx->patch_ios.output_range.io : &ctx->outputs[j];
-                  get_source_info_patch(srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
-               } else {
-                  strbuf_fmt(src_buf, "%s(%s%s%s%s)", get_string(srcstypeprefix), prefix, ctx->outputs[j].glsl_name, arrayname, ctx->outputs[j].is_int ? "" : swizzle);
-               }
-               sinfo->override_no_wm[i] = ctx->outputs[j].override_no_wm;
-               break;
+         if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT &&
+             ctx->key->color_two_side && input->name == TGSI_SEMANTIC_COLOR)
+            strbuf_fmt(src_buf, "%s(%s%s%d%s%s)", get_string(stypeprefix), prefix, "realcolor", input->sid, arrayname, swizzle);
+         else if (input->glsl_gl_block) {
+            /* GS input clipdist requires a conversion */
+            if (input->name == TGSI_SEMANTIC_CLIPDIST) {
+               create_swizzled_clipdist(ctx, src_buf, src, j, true, get_string(stypeprefix), prefix, arrayname, input->first);
+            } else {
+               strbuf_fmt(src_buf, "%s(vec4(%sgl_in%s.%s)%s)", get_string(stypeprefix), prefix, arrayname, input->glsl_name, swizzle);
             }
          }
+         else if (input->name == TGSI_SEMANTIC_PRIMID)
+            strbuf_fmt(src_buf, "%s(vec4(intBitsToFloat(%s)))", get_string(stypeprefix), input->glsl_name);
+         else if (input->name == TGSI_SEMANTIC_FACE)
+            strbuf_fmt(src_buf, "%s(%s ? 1.0 : -1.0)", get_string(stypeprefix), input->glsl_name);
+         else if (input->name == TGSI_SEMANTIC_CLIPDIST) {
+            if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT)
+               load_clipdist_fs(ctx, src_buf, src, j, false, get_string(stypeprefix), input->first);
+            else
+               create_swizzled_clipdist(ctx, src_buf, src, j, false, get_string(stypeprefix), prefix, arrayname, input->first);
+         }  else if (input->name == TGSI_SEMANTIC_TESSOUTER ||
+                     input->name == TGSI_SEMANTIC_TESSINNER) {
+            get_tesslevel_as_source(src_buf, prefix, input->glsl_name, &src->Register);
+         } else {
+            enum vrend_type_qualifier srcstypeprefix = stypeprefix;
+            if (input->type != VEC_FLOAT) {
+               if (stype == TGSI_TYPE_UNSIGNED)
+                  srcstypeprefix = UVEC4;
+               else if (stype == TGSI_TYPE_SIGNED)
+                  srcstypeprefix = IVEC4;
+               else if (input->type == VEC_INT)
+                  srcstypeprefix = INT_BITS_TO_FLOAT;
+               else // input->type == VEC_UINT
+                  srcstypeprefix = UINT_BITS_TO_FLOAT;
+            }
+
+            if (inst->Instruction.Opcode == TGSI_OPCODE_INTERP_SAMPLE && i == 1) {
+               strbuf_fmt(src_buf, "floatBitsToInt(%s%s%s%s)", prefix, input->glsl_name, arrayname, swizzle);
+            } else if (input->name == TGSI_SEMANTIC_GENERIC) {
+               struct vrend_shader_io *io = ctx->generic_ios.input_range.used ? &ctx->generic_ios.input_range.io : &ctx->inputs[j];
+               get_source_info_generic(ctx, io_in, srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
+            } else if (input->name == TGSI_SEMANTIC_TEXCOORD) {
+               get_source_info_generic(ctx, io_in, srcstypeprefix, prefix, src, &ctx->inputs[j], arrayname, swizzle, src_buf);
+            } else if (input->name == TGSI_SEMANTIC_PATCH) {
+               struct vrend_shader_io *io = ctx->patch_ios.input_range.used ? &ctx->patch_ios.input_range.io : &ctx->inputs[j];
+               get_source_info_patch(srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
+            } else if (input->name == TGSI_SEMANTIC_POSITION && ctx->prog_type == TGSI_PROCESSOR_VERTEX &&
+                       input->first != input->last) {
+               if (src->Register.Indirect)
+                  strbuf_fmt(src_buf, "%s(%s%s%s[addr%d + %d]%s)", get_string(srcstypeprefix), prefix, input->glsl_name, arrayname,
+                             src->Indirect.Index, src->Register.Index, input->is_int ? "" : swizzle);
+               else
+                  strbuf_fmt(src_buf, "%s(%s%s%s[%d]%s)", get_string(srcstypeprefix), prefix, input->glsl_name, arrayname,
+                             src->Register.Index, input->is_int ? "" : swizzle);
+            } else
+               strbuf_fmt(src_buf, "%s(%s%s%s%s)", get_string(srcstypeprefix), prefix, input->glsl_name, arrayname, input->is_int ? "" : swizzle);
+         }
+         sinfo->override_no_wm[i] = input->override_no_wm;
+      } else if (src->Register.File == TGSI_FILE_OUTPUT) {
+         int j = find_io_index(ctx->num_outputs, ctx->outputs, src->Register.Index,
+                           usage_mask);
+         if (j < 0)
+            return false;
+
+         struct vrend_shader_io *output = &ctx->outputs[j];
+
+         if (inst->Instruction.Opcode == TGSI_OPCODE_FBFETCH) {
+            output->fbfetch_used = true;
+            ctx->shader_req_bits |= SHADER_REQ_FBFETCH;
+         }
+
+         enum vrend_type_qualifier srcstypeprefix = stypeprefix;
+         if (stype == TGSI_TYPE_UNSIGNED && output->is_int)
+            srcstypeprefix = TYPE_CONVERSION_NONE;
+         if (output->glsl_gl_block) {
+            if (output->name == TGSI_SEMANTIC_CLIPDIST) {
+               char clip_indirect[32] = "";
+               if (output->first != output->last) {
+                  if (src->Register.Indirect)
+                     snprintf(clip_indirect, sizeof(clip_indirect), "+ addr%d", src->Indirect.Index);
+                  else
+                     snprintf(clip_indirect, sizeof(clip_indirect), "+ %d", src->Register.Index - output->first);
+               }
+               strbuf_fmt(src_buf, "clip_dist_temp[%d%s]", output->sid, clip_indirect);
+            }
+         } else if (output->name == TGSI_SEMANTIC_GENERIC) {
+            struct vrend_shader_io *io = ctx->generic_ios.output_range.used ? &ctx->generic_ios.output_range.io : &ctx->outputs[j];
+            get_source_info_generic(ctx, io_out, srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
+         } else if (output->name == TGSI_SEMANTIC_PATCH) {
+            struct vrend_shader_io *io = ctx->patch_ios.output_range.used ? &ctx->patch_ios.output_range.io : &ctx->outputs[j];
+            get_source_info_patch(srcstypeprefix, prefix, src, io, arrayname, swizzle, src_buf);
+         } else if (output->name == TGSI_SEMANTIC_TESSOUTER ||
+                    output->name == TGSI_SEMANTIC_TESSINNER) {
+            get_tesslevel_as_source(src_buf, prefix, output->glsl_name, &src->Register);
+         } else {
+            strbuf_fmt(src_buf, "%s(%s%s%s%s)", get_string(srcstypeprefix), prefix, output->glsl_name, arrayname, output->is_int ? "" : swizzle);
+         }
+         sinfo->override_no_wm[i] = output->override_no_wm;
       } else if (src->Register.File == TGSI_FILE_TEMPORARY) {
          struct vrend_temp_range *range = find_temp_range(ctx, src->Register.Index);
          if (!range)
@@ -4292,12 +4713,15 @@ get_source_info(struct dump_ctx *ctx,
                   sinfo->override_no_cast[i] = true;
                } else if (ctx->system_values[j].name == TGSI_SEMANTIC_SAMPLEMASK) {
                   const char *vec_type = "ivec4";
-                  if (ctx->cfg->use_gles &&
-                      (inst->Instruction.Opcode == TGSI_OPCODE_AND) &&
-                      (stype == TGSI_TYPE_UNSIGNED))
+                  enum vrend_type_qualifier srcstypeprefix = TYPE_CONVERSION_NONE;
+                  if (stypeprefix == TYPE_CONVERSION_NONE)
+                     srcstypeprefix = INT_BITS_TO_FLOAT;
+                  else if (stype == TGSI_TYPE_UNSIGNED)
                      vec_type = "uvec4";
+
                   ctx->shader_req_bits |= SHADER_REQ_SAMPLE_SHADING | SHADER_REQ_INTS;
-                  strbuf_fmt(src_buf, "%s(%s, %s, %s, %s)",
+                  strbuf_fmt(src_buf, "%s(%s(%s, %s, %s, %s))",
+                     get_string(srcstypeprefix),
                      vec_type,
                      src->Register.SwizzleX == TGSI_SWIZZLE_X ? ctx->system_values[j].glsl_name : "0",
                      src->Register.SwizzleY == TGSI_SWIZZLE_X ? ctx->system_values[j].glsl_name : "0",
@@ -4313,15 +4737,17 @@ get_source_info(struct dump_ctx *ctx,
             if (src->Dimension.Index == ctx->abo_idx[j] &&
                 src->Register.Index >= ctx->abo_offsets[j] &&
                 src->Register.Index < ctx->abo_offsets[j] + ctx->abo_sizes[j]) {
+               int abo_idx = ctx->abo_idx[j];
+               int abo_offset = ctx->abo_offsets[j] * 4;
                if (ctx->abo_sizes[j] > 1) {
                   int offset = src->Register.Index - ctx->abo_offsets[j];
                   if (src->Register.Indirect) {
                      assert(src->Indirect.File == TGSI_FILE_ADDRESS);
-                     strbuf_fmt(src_buf, "ac%d[addr%d + %d]", j, src->Indirect.Index, offset);
+                     strbuf_fmt(src_buf, "ac%d_%d[addr%d + %d]", abo_idx, abo_offset, src->Indirect.Index, offset);
                   } else
-                     strbuf_fmt(src_buf, "ac%d[%d]", j, offset);
+                     strbuf_fmt(src_buf, "ac%d_%d[%d]", abo_idx, abo_offset, offset);
                } else
-                  strbuf_fmt(src_buf, "ac%d", j);
+                  strbuf_fmt(src_buf, "ac%d_%d", abo_idx, abo_offset);
                break;
             }
          }
@@ -4368,23 +4794,22 @@ static
 void rewrite_io_ranged(struct dump_ctx *ctx)
 {
    if ((ctx->info.indirect_files & (1 << TGSI_FILE_INPUT)) ||
-       ctx->key->num_indirect_generic_inputs ||
-       ctx->key->num_indirect_patch_inputs) {
+       ctx->key->input.num_indirect_generic ||
+       ctx->key->input.num_indirect_patch) {
 
       for (uint i = 0; i < ctx->num_inputs; ++i) {
          if (ctx->inputs[i].name == TGSI_SEMANTIC_PATCH) {
             ctx->inputs[i].glsl_predefined_no_emit = true;
             if (ctx->inputs[i].sid < ctx->patch_ios.input_range.io.sid || ctx->patch_ios.input_range.used == false) {
-               ctx->patch_ios.input_range.io.first = i;
-               ctx->patch_ios.input_range.io.usage_mask = 0xf;
-               ctx->patch_ios.input_range.io.name = TGSI_SEMANTIC_PATCH;
                ctx->patch_ios.input_range.io.sid = ctx->inputs[i].sid;
+               ctx->patch_ios.input_range.io.first = i;
+               ctx->patch_ios.input_range.io.name = TGSI_SEMANTIC_PATCH;
                ctx->patch_ios.input_range.used = true;
                if (ctx->cfg->has_arrays_of_arrays && !ctx->cfg->use_gles)
                   ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
-            if (ctx->inputs[i].sid > ctx->patch_ios.input_range.io.last)
-               ctx->patch_ios.input_range.io.last = ctx->inputs[i].sid;
+            if (i > ctx->patch_ios.input_range.io.last)
+               ctx->patch_ios.input_range.io.last = i;
          }
 
          if (ctx->inputs[i].name == TGSI_SEMANTIC_GENERIC) {
@@ -4393,20 +4818,23 @@ void rewrite_io_ranged(struct dump_ctx *ctx)
                ctx->generic_ios.input_range.io.sid = ctx->inputs[i].sid;
                ctx->generic_ios.input_range.io.first = i;
                ctx->generic_ios.input_range.io.name = TGSI_SEMANTIC_GENERIC;
-               ctx->generic_ios.input_range.io.num_components = 4;
                ctx->generic_ios.input_range.used = true;
                if (ctx->cfg->has_arrays_of_arrays && !ctx->cfg->use_gles)
                   ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
-            if (ctx->inputs[i].sid > ctx->generic_ios.input_range.io.last)
-               ctx->generic_ios.input_range.io.last = ctx->inputs[i].sid;
+            if (i > ctx->generic_ios.input_range.io.last)
+               ctx->generic_ios.input_range.io.last = i;
          }
-
-         if (ctx->key->num_indirect_generic_inputs > 0)
-            ctx->generic_ios.input_range.io.last = ctx->generic_ios.input_range.io.sid + ctx->key->num_indirect_generic_inputs - 1;
-         if (ctx->key->num_indirect_patch_inputs > 0)
-            ctx->patch_ios.input_range.io.last = ctx->patch_ios.input_range.io.sid + ctx->key->num_indirect_patch_inputs - 1;
       }
+
+      if (ctx->key->input.num_indirect_generic > 0)
+         ctx->generic_ios.input_range.io.last = ctx->generic_ios.input_range.io.first +
+            ctx->key->input.num_indirect_generic - 1;
+
+      if (ctx->key->input.num_indirect_patch > 0)
+         ctx->patch_ios.input_range.io.last = ctx->patch_ios.input_range.io.first +
+            ctx->key->input.num_indirect_patch - 1;
+
       snprintf(ctx->patch_ios.input_range.io.glsl_name, 64, "%s_p%d",
                get_stage_input_name_prefix(ctx, ctx->prog_type), ctx->patch_ios.input_range.io.sid);
       snprintf(ctx->generic_ios.input_range.io.glsl_name, 64, "%s_g%d",
@@ -4414,33 +4842,31 @@ void rewrite_io_ranged(struct dump_ctx *ctx)
 
       ctx->generic_ios.input_range.io.num_components = 4;
       ctx->generic_ios.input_range.io.usage_mask = 0xf;
-      ctx->generic_ios.input_range.io.swizzle_offset = 0;
 
       ctx->patch_ios.input_range.io.num_components = 4;
       ctx->patch_ios.input_range.io.usage_mask = 0xf;
-      ctx->patch_ios.input_range.io.swizzle_offset = 0;
 
       if (prefer_generic_io_block(ctx, io_in))
           ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
    }
 
    if ((ctx->info.indirect_files & (1 << TGSI_FILE_OUTPUT)) ||
-       ctx->key->num_indirect_generic_outputs ||
-       ctx->key->num_indirect_patch_outputs) {
+       ctx->key->output.num_indirect_generic ||
+       ctx->key->output.num_indirect_patch) {
 
       for (uint i = 0; i < ctx->num_outputs; ++i) {
          if (ctx->outputs[i].name == TGSI_SEMANTIC_PATCH) {
             ctx->outputs[i].glsl_predefined_no_emit = true;
             if (ctx->outputs[i].sid < ctx->patch_ios.output_range.io.sid || ctx->patch_ios.output_range.used == false) {
+               ctx->patch_ios.output_range.io.sid = ctx->outputs[i].sid;
                ctx->patch_ios.output_range.io.first = i;
                ctx->patch_ios.output_range.io.name = TGSI_SEMANTIC_PATCH;
-               ctx->patch_ios.output_range.io.sid = ctx->outputs[i].sid;
                ctx->patch_ios.output_range.used = true;
                if (ctx->cfg->has_arrays_of_arrays && !ctx->cfg->use_gles)
                   ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
-            if (ctx->outputs[i].sid > ctx->patch_ios.output_range.io.last) {
-               ctx->patch_ios.output_range.io.last = ctx->outputs[i].sid;
+            if (i > ctx->patch_ios.output_range.io.last) {
+               ctx->patch_ios.output_range.io.last = i;
             }
          }
 
@@ -4451,16 +4877,23 @@ void rewrite_io_ranged(struct dump_ctx *ctx)
                ctx->generic_ios.output_range.io.first = i;
                ctx->generic_ios.output_range.io.name = TGSI_SEMANTIC_GENERIC;
                ctx->generic_ios.output_range.used = true;
-               ctx->generic_ios.output_range.io.usage_mask = 0xf;
-               ctx->generic_ios.output_range.io.num_components = 4;
                if (ctx->cfg->has_arrays_of_arrays && !ctx->cfg->use_gles)
                   ctx->shader_req_bits |= SHADER_REQ_ARRAYS_OF_ARRAYS;
             }
-            if (ctx->outputs[i].sid > ctx->generic_ios.output_range.io.last) {
-               ctx->generic_ios.output_range.io.last = ctx->outputs[i].sid;
+            if (i > ctx->generic_ios.output_range.io.last) {
+               ctx->generic_ios.output_range.io.last = i;
             }
          }
       }
+
+      if (ctx->key->output.num_indirect_generic > 0)
+         ctx->generic_ios.output_range.io.last = ctx->generic_ios.output_range.io.first +
+            ctx->key->output.num_indirect_generic - 1;
+
+      if (ctx->key->output.num_indirect_patch > 0)
+         ctx->patch_ios.output_range.io.last = ctx->patch_ios.output_range.io.first +
+            ctx->key->output.num_indirect_patch - 1;
+
       snprintf(ctx->patch_ios.output_range.io.glsl_name, 64, "%s_p%d",
                get_stage_output_name_prefix(ctx->prog_type), ctx->patch_ios.output_range.io.sid);
       snprintf(ctx->generic_ios.output_range.io.glsl_name, 64, "%s_g%d",
@@ -4468,12 +4901,9 @@ void rewrite_io_ranged(struct dump_ctx *ctx)
 
       ctx->generic_ios.output_range.io.num_components = 4;
       ctx->generic_ios.output_range.io.usage_mask = 0xf;
-      ctx->generic_ios.output_range.io.swizzle_offset = 0;
 
       ctx->patch_ios.output_range.io.num_components = 4;
       ctx->patch_ios.output_range.io.usage_mask = 0xf;
-      ctx->patch_ios.output_range.io.swizzle_offset = 0;
-
 
       if (prefer_generic_io_block(ctx, io_out))
           ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
@@ -4527,7 +4957,6 @@ void rewrite_components(unsigned nio, struct vrend_shader_io *io,
 
       io[i].usage_mask = 0xf;
       io[i].num_components = 4;
-      io[i].swizzle_offset = 0;
       io[i].override_no_wm = false;
    }
 
@@ -4571,7 +5000,7 @@ void emit_fs_clipdistance_load(const struct dump_ctx *ctx,
    if (!ctx->fs_uses_clipdist_input)
       return;
 
-   int prev_num = ctx->key->prev_stage_num_clip_out + ctx->key->prev_stage_num_cull_out;
+   int prev_num = ctx->key->num_in_clip + ctx->key->num_in_cull;
    int ndists;
    const char *prefix="";
 
@@ -4595,12 +5024,12 @@ void emit_fs_clipdistance_load(const struct dump_ctx *ctx,
       }
       bool is_cull = false;
       if (prev_num > 0) {
-         if (i >= ctx->key->prev_stage_num_clip_out && i < prev_num)
+         if (i >= ctx->key->num_in_clip && i < prev_num)
             is_cull = true;
       }
       const char *clip_cull = is_cull ? "Cull" : "Clip";
       emit_buff(glsl_strbufs, "clip_dist_temp[%d].%c = %sgl_%sDistance[%d];\n", clipidx, wm, prefix, clip_cull,
-                is_cull ? i - ctx->key->prev_stage_num_clip_out : i);
+                is_cull ? i - ctx->key->num_in_clip : i);
    }
 }
 
@@ -4610,12 +5039,10 @@ void emit_fs_clipdistance_load(const struct dump_ctx *ctx,
  * previous shader stage to the according inputs.
  */
 
-static bool apply_prev_layout(const struct vrend_shader_key *key,
+static void apply_prev_layout(const struct vrend_shader_key *key,
                               struct vrend_shader_io inputs[],
                               uint32_t *num_inputs)
 {
-   bool require_enhanced_layouts = false;
-
    /* Walk through all inputs and see whether we have a corresonding output from
     * the previous shader that uses a different layout. It may even be that one
     * input be the combination of two inputs. */
@@ -4626,14 +5053,14 @@ static bool apply_prev_layout(const struct vrend_shader_key *key,
 
       if (io->name == TGSI_SEMANTIC_GENERIC || io->name == TGSI_SEMANTIC_PATCH) {
 
+         bool already_found_one = false;
          const struct vrend_layout_info *layout = key->prev_stage_generic_and_patch_outputs_layout;
-         for (unsigned generic_index = 0; generic_index  < key->num_prev_generic_and_patch_outputs; ++generic_index, ++layout) {
-
-            bool already_found_one = false;
+         for (unsigned generic_index = 0; generic_index  < key->input.num_generic_and_patch; ++generic_index, ++layout) {
 
             /* Identify by sid and arrays_id  */
-            if (io->sid == layout->sid && (io->array_id == layout->array_id)) {
-               unsigned new_mask = io->usage_mask;
+            if (io->sid == layout->sid &&
+                (io->array_id == layout->array_id) &&
+                (io->name == layout->name)) {
 
                /* We have already one IO with the same SID and arrays ID, so we need to duplicate it */
                if (already_found_one) {
@@ -4649,12 +5076,10 @@ static bool apply_prev_layout(const struct vrend_shader_key *key,
                }
 
                if (already_found_one) {
-                  new_mask = io->usage_mask = (uint8_t)layout->usage_mask;
+                  io->usage_mask = (uint8_t)layout->usage_mask;
                   io->layout_location = layout->location;
                   io->array_id = layout->array_id;
-
-                  u_bit_scan_consecutive_range(&new_mask, &io->swizzle_offset, &io->num_components);
-                  require_enhanced_layouts |= io->swizzle_offset > 0;
+                  io->num_components = 4;
                   if (io->num_components == 1)
                      io->override_no_wm = true;
                   if (i_input < *num_inputs - 1) {
@@ -4667,13 +5092,11 @@ static bool apply_prev_layout(const struct vrend_shader_key *key,
       ++io;
       ++i_input;
    }
-   return require_enhanced_layouts;
 }
 
-static bool evaluate_layout_overlays(unsigned nio, struct vrend_shader_io *io,
+static void evaluate_layout_overlays(unsigned nio, struct vrend_shader_io *io,
                                      const char *name_prefix, unsigned coord_replace)
 {
-   bool require_enhanced_layouts = 0;
    int next_loc = 1;
 
    /* IO elements may be emitted for the same location but with
@@ -4688,14 +5111,16 @@ static bool evaluate_layout_overlays(unsigned nio, struct vrend_shader_io *io,
       if ((io[i].name != TGSI_SEMANTIC_GENERIC &&
           io[i].name != TGSI_SEMANTIC_PATCH) ||
           io[i].usage_mask == 0xf ||
-          io[i].layout_location > 0)
+          io[i].layout_location > 0 ||
+          io[i].overlapping_array)
          continue;
 
       for (unsigned j = i + 1; j < nio ; ++j) {
          if ((io[j].name != TGSI_SEMANTIC_GENERIC &&
              io[j].name != TGSI_SEMANTIC_PATCH) ||
              io[j].usage_mask == 0xf ||
-             io[j].layout_location > 0)
+             io[j].layout_location > 0 ||
+             io[j].overlapping_array)
             continue;
 
          /* Do the definition ranges overlap? */
@@ -4710,16 +5135,11 @@ static bool evaluate_layout_overlays(unsigned nio, struct vrend_shader_io *io,
             io[i].layout_location = next_loc++;
             io[j].layout_location = next_loc++;
          }
-         require_enhanced_layouts = true;
       }
    }
 
    rename_variables(nio, io, name_prefix, coord_replace);
-
-   return require_enhanced_layouts;
 }
-
-
 
 static
 void renumber_io_arrays(unsigned nio, struct vrend_shader_io *io)
@@ -4757,37 +5177,27 @@ static void handle_io_arrays(struct dump_ctx *ctx)
    if (ctx->prog_type == TGSI_PROCESSOR_GEOMETRY ||
        ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL ||
        ctx->prog_type == TGSI_PROCESSOR_TESS_EVAL)
-      require_enhanced_layouts |= apply_prev_layout(ctx->key, ctx->inputs, &ctx->num_inputs);
+      apply_prev_layout(ctx->key, ctx->inputs, &ctx->num_inputs);
 
    if (ctx->guest_sent_io_arrays)  {
       if (ctx->num_inputs > 0)
-         if (evaluate_layout_overlays(ctx->num_inputs, ctx->inputs,
+         evaluate_layout_overlays(ctx->num_inputs, ctx->inputs,
                                       get_stage_input_name_prefix(ctx, ctx->prog_type),
-                                      ctx->key->coord_replace)) {
-            require_enhanced_layouts = true;
-         }
+                                      ctx->key->fs.coord_replace);
 
       if (ctx->num_outputs > 0)
-         if (evaluate_layout_overlays(ctx->num_outputs, ctx->outputs,
-                                      get_stage_output_name_prefix(ctx->prog_type), 0)){
-            require_enhanced_layouts = true;
-         }
-
+         evaluate_layout_overlays(ctx->num_outputs, ctx->outputs,
+                                  get_stage_output_name_prefix(ctx->prog_type), 0);
    } else {
       /* The guest didn't send real arrays, do we might have to add a big array
        * for all generic and another ofr patch inputs */
       rewrite_io_ranged(ctx);
       rewrite_components(ctx->num_inputs, ctx->inputs,
                          get_stage_input_name_prefix(ctx, ctx->prog_type),
-                         ctx->key->coord_replace, true);
+                         ctx->key->fs.coord_replace, true);
 
       rewrite_components(ctx->num_outputs, ctx->outputs,
                          get_stage_output_name_prefix(ctx->prog_type), 0, true);
-   }
-
-   if (require_enhanced_layouts) {
-      ctx->shader_req_bits |= SHADER_REQ_ENHANCED_LAYOUTS;
-      ctx->shader_req_bits |= SHADER_REQ_SEPERATE_SHADER_OBJECTS;
    }
 }
 
@@ -4800,11 +5210,11 @@ iter_instruction(struct tgsi_iterate_context *iter,
    struct dest_info dinfo = { 0 };
    struct source_info sinfo = { 0 };
    const char *srcs[4];
-   char dsts[3][255];
+   char *dsts[3];
    char fp64_dsts[3][255];
    uint instno = ctx->instno++;
    char writemask[6] = "";
-   char src_swizzle0[10];
+   char src_swizzle0[16];
 
    sinfo.svec4 = VEC4;
 
@@ -4834,7 +5244,10 @@ iter_instruction(struct tgsi_iterate_context *iter,
        * GLSL < 4.30 it is required to match the output of the previous stage */
       if (!ctx->cfg->use_gles) {
          for (unsigned i = 0; i < ctx->num_inputs; ++i) {
-            if (ctx->key->force_invariant_inputs & (1ull << ctx->inputs[i].sid))
+            uint32_t bit_pos = varying_bit_from_semantic_and_index(ctx->inputs[i].name, ctx->inputs[i].sid);
+            uint32_t slot = bit_pos / 32;
+            uint32_t bit = 1u << (bit_pos & 0x1f);
+            if (ctx->key->force_invariant_inputs[slot] & bit)
                ctx->inputs[i].invariant = 1;
             else
                ctx->inputs[i].invariant = 0;
@@ -4842,7 +5255,7 @@ iter_instruction(struct tgsi_iterate_context *iter,
       }
    }
 
-   if (!get_destination_info(ctx, inst, &dinfo, dsts, fp64_dsts, writemask))
+   if (!get_destination_info(ctx, inst, &dinfo, ctx->dst_bufs, fp64_dsts, writemask))
       return false;
 
    if (!get_source_info(ctx, inst, &sinfo, ctx->src_bufs, src_swizzle0))
@@ -4850,6 +5263,9 @@ iter_instruction(struct tgsi_iterate_context *iter,
 
    for (size_t i = 0; i < ARRAY_SIZE(srcs); ++i)
       srcs[i] = ctx->src_bufs[i].buf;
+
+   for (size_t i = 0; i < ARRAY_SIZE(dsts); ++i)
+      dsts[i] = ctx->dst_bufs[i].buf;
 
    switch (inst->Instruction.Opcode) {
    case TGSI_OPCODE_SQRT:
@@ -4958,9 +5374,11 @@ iter_instruction(struct tgsi_iterate_context *iter,
       emit_buff(&ctx->glsl_strbufs, "%s = %s(1.0LF/(%s));\n", dsts[0], get_string(dinfo.dstconv), srcs[0]);
       break;
    case TGSI_OPCODE_FLR:
+   case TGSI_OPCODE_DFLR:
       emit_op1("floor");
       break;
    case TGSI_OPCODE_ROUND:
+   case TGSI_OPCODE_DROUND:
       // There is no TGSI OPCODE for roundEven, prefer roundEven
       // so roundEven in guest gets translated to roundEven.
       if ((ctx->cfg->use_gles && ctx->cfg->glsl_version >= 300) ||
@@ -4973,6 +5391,7 @@ iter_instruction(struct tgsi_iterate_context *iter,
       emit_op1("sign");
       break;
    case TGSI_OPCODE_CEIL:
+   case TGSI_OPCODE_DCEIL:
       emit_op1("ceil");
       break;
    case TGSI_OPCODE_FRC:
@@ -4980,9 +5399,11 @@ iter_instruction(struct tgsi_iterate_context *iter,
       emit_op1("fract");
       break;
    case TGSI_OPCODE_TRUNC:
+   case TGSI_OPCODE_DTRUNC:
       emit_op1("trunc");
       break;
    case TGSI_OPCODE_SSG:
+   case TGSI_OPCODE_DSSG:
       emit_op1("sign");
       break;
    case TGSI_OPCODE_RSQ:
@@ -5161,9 +5582,9 @@ iter_instruction(struct tgsi_iterate_context *iter,
    case TGSI_OPCODE_END:
       if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX) {
          handle_vertex_proc_exit(ctx, &ctx->glsl_strbufs, &ctx->has_clipvertex_so);
-      } else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL) {
+      } else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_CTRL && ctx->cfg->has_cull_distance) {
          emit_clip_dist_movs(ctx, &ctx->glsl_strbufs);
-      } else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL) {
+      } else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL && ctx->cfg->has_cull_distance) {
 	 if (ctx->so && !ctx->key->gs_present)
             emit_so_movs(ctx, &ctx->glsl_strbufs, &ctx->has_clipvertex_so);
          emit_clip_dist_movs(ctx, &ctx->glsl_strbufs);
@@ -5207,7 +5628,8 @@ iter_instruction(struct tgsi_iterate_context *iter,
       struct immed *imd = &ctx->imm[(inst->Src[0].Register.Index)];
       if (ctx->so && ctx->key->gs_present)
          emit_so_movs(ctx, &ctx->glsl_strbufs, &ctx->has_clipvertex_so);
-      emit_clip_dist_movs(ctx, &ctx->glsl_strbufs);
+      if (ctx->cfg->has_cull_distance && ctx->key->gs.emit_clip_distance)
+         emit_clip_dist_movs(ctx, &ctx->glsl_strbufs);
       emit_prescale(&ctx->glsl_strbufs);
       if (imd->val[inst->Src[0].Register.SwizzleX].ui > 0) {
          ctx->shader_req_bits |= SHADER_REQ_GPU_SHADER5;
@@ -5311,7 +5733,7 @@ iter_instruction(struct tgsi_iterate_context *iter,
                emit_buf(&ctx->glsl_strbufs, "memoryBarrierBuffer();\n");
             }
             if (val & TGSI_MEMBAR_ATOMIC_BUFFER) {
-               emit_buf(&ctx->glsl_strbufs, "memoryBarrierAtomic();\n");
+               emit_buf(&ctx->glsl_strbufs, "memoryBarrierAtomicCounter();\n");
             }
             if (val & TGSI_MEMBAR_SHADER_IMAGE) {
                emit_buf(&ctx->glsl_strbufs, "memoryBarrierImage();\n");
@@ -5411,8 +5833,8 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
    if (ctx->cfg->use_gles) {
       emit_ver_extf(glsl_strbufs, "#version %d es\n", ctx->cfg->glsl_version);
 
-      if ((ctx->shader_req_bits & SHADER_REQ_CLIP_DISTANCE)||
-          (ctx->num_clip_dist == 0 && ctx->key->clip_plane_enable)) {
+      if ((ctx->shader_req_bits & SHADER_REQ_CLIP_DISTANCE) ||
+          (ctx->cfg->has_cull_distance && ctx->num_out_clip_dist == 0)) {
          emit_ext(glsl_strbufs, "EXT_clip_cull_distance", "require");
       }
 
@@ -5427,6 +5849,8 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
             emit_ext(glsl_strbufs, "EXT_shader_framebuffer_fetch", "require");
          if (ctx->shader_req_bits & SHADER_REQ_BLEND_EQUATION_ADVANCED)
             emit_ext(glsl_strbufs, "KHR_blend_equation_advanced", "require");
+         if (ctx->cfg->has_dual_src_blend)
+            emit_ext(glsl_strbufs, "EXT_blend_func_extended", "require");
       }
 
       if (ctx->shader_req_bits & SHADER_REQ_VIEWPORT_IDX)
@@ -5473,7 +5897,7 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
       }
 
       if (logiop_require_inout(ctx->key)) {
-         if (ctx->key->fs_logicop_emulate_coherent)
+         if (ctx->cfg->has_fbfetch_coherent)
             emit_ext(glsl_strbufs, "EXT_shader_framebuffer_fetch", "require");
          else
             emit_ext(glsl_strbufs, "EXT_shader_framebuffer_fetch_non_coherent", "require");
@@ -5524,7 +5948,7 @@ static void emit_header(const struct dump_ctx *ctx, struct vrend_glsl_strbufs *g
       if (ctx->ubo_used_mask)
          emit_ext(glsl_strbufs, "ARB_uniform_buffer_object", "require");
 
-      if (ctx->num_cull_dist_prop || ctx->key->prev_stage_num_cull_out)
+      if (ctx->num_cull_dist_prop || ctx->key->num_in_cull || ctx->key->num_out_cull)
          emit_ext(glsl_strbufs, "ARB_cull_distance", "require");
       if (ctx->ssbo_used_mask)
          emit_ext(glsl_strbufs, "ARB_shader_storage_buffer_object", "require");
@@ -5891,6 +6315,7 @@ static int emit_ios_common(const struct dump_ctx *ctx,
       for (i = 0; i < ctx->num_sampler_arrays; i++) {
          uint32_t first = ctx->sampler_arrays[i].first;
          uint32_t range = ctx->sampler_arrays[i].array_size;
+
          emit_sampler_decl(ctx, glsl_strbufs, shadow_samp_mask, first, range, ctx->samplers + first);
       }
    } else {
@@ -5903,6 +6328,10 @@ static int emit_ios_common(const struct dump_ctx *ctx,
          emit_sampler_decl(ctx, glsl_strbufs, shadow_samp_mask, i, 0, ctx->samplers + i);
       }
    }
+
+   if (ctx->cfg->use_gles && ctx->gles_use_tex_query_level)
+      emit_hdrf(glsl_strbufs, "uniform int %s_texlod[%d];\n", tgsi_proc_to_prefix(ctx->info.processor),
+                util_bitcount(ctx->samplers_used));
 
    if (ctx->info.indirect_files & (1 << TGSI_FILE_IMAGE)) {
       for (i = 0; i < ctx->num_image_arrays; i++) {
@@ -5919,10 +6348,10 @@ static int emit_ios_common(const struct dump_ctx *ctx,
    }
 
    for (i = 0; i < ctx->num_abo; i++){
+      emit_hdrf(glsl_strbufs, "layout (binding = %d, offset = %d) uniform atomic_uint ac%d_%d", ctx->abo_idx[i], ctx->abo_offsets[i] * 4, ctx->abo_idx[i], ctx->abo_offsets[i] * 4);
       if (ctx->abo_sizes[i] > 1)
-         emit_hdrf(glsl_strbufs, "layout (binding = %d, offset = %d) uniform atomic_uint ac%d[%d];\n", ctx->abo_idx[i], ctx->abo_offsets[i] * 4, i, ctx->abo_sizes[i]);
-      else
-         emit_hdrf(glsl_strbufs, "layout (binding = %d, offset = %d) uniform atomic_uint ac%d;\n", ctx->abo_idx[i], ctx->abo_offsets[i] * 4, i);
+         emit_hdrf(glsl_strbufs, "[%d]", ctx->abo_sizes[i]);
+      emit_hdrf(glsl_strbufs, ";\n");
    }
 
    if (ctx->info.indirect_files & (1 << TGSI_FILE_BUFFER)) {
@@ -5966,7 +6395,7 @@ static void emit_ios_streamout(const struct dump_ctx *ctx,
             const struct vrend_shader_io *output = get_io_slot(&ctx->outputs[0], ctx->num_outputs,
                   ctx->so->output[i].register_index);
             if (ctx->so->output[i].need_temp || output->name == TGSI_SEMANTIC_CLIPDIST ||
-                output->glsl_predefined_no_emit) {
+                ctx->prog_type == TGSI_PROCESSOR_GEOMETRY || output->glsl_predefined_no_emit) {
 
                if (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL)
                   emit_hdrf(glsl_strbufs, "out %s tfout%d[];\n", outtype, i);
@@ -5988,7 +6417,12 @@ static void emit_ios_indirect_generics_output(const struct dump_ctx *ctx,
                                               const char *postfix)
 {
    if (ctx->generic_ios.output_range.used) {
-      int size = ctx->generic_ios.output_range.io.last - ctx->generic_ios.output_range.io.sid + 1;
+      int size = ctx->generic_ios.output_range.io.last -
+         ctx->generic_ios.output_range.io.first + 1;
+      char array_handle[32] = "";
+      if (size > 1)
+         snprintf(array_handle, sizeof(array_handle), "[%d]", size);
+
       if (prefer_generic_io_block(ctx, io_out)) {
          char blockname[64];
          const char *stage_prefix = get_stage_output_name_prefix(ctx->prog_type);
@@ -5997,13 +6431,13 @@ static void emit_ios_indirect_generics_output(const struct dump_ctx *ctx,
          char blockvarame[64];
          get_blockvarname(blockvarame, stage_prefix, &ctx->generic_ios.output_range.io, postfix);
 
-         emit_hdrf(glsl_strbufs, "out %s {\n  vec4 %s[%d]; \n} %s;\n", blockname,
-                   ctx->generic_ios.output_range.io.glsl_name, size, blockvarame);
+         emit_hdrf(glsl_strbufs, "out %s {\n  vec4 %s%s; \n} %s;\n", blockname,
+                   ctx->generic_ios.output_range.io.glsl_name, array_handle, blockvarame);
       } else
-         emit_hdrf(glsl_strbufs, "out vec4 %s%s[%d];\n",
+         emit_hdrf(glsl_strbufs, "out vec4 %s%s%s;\n",
                    ctx->generic_ios.output_range.io.glsl_name,
                    postfix,
-                   size);
+                   array_handle);
    }
 }
 
@@ -6012,12 +6446,17 @@ static void emit_ios_indirect_generics_input(const struct dump_ctx *ctx,
                                              const char *postfix)
 {
    if (ctx->generic_ios.input_range.used) {
-      int size = ctx->generic_ios.input_range.io.last - ctx->generic_ios.input_range.io.sid + 1;
+      int size = ctx->generic_ios.input_range.io.last -
+         ctx->generic_ios.input_range.io.first + 1;
+      char array_handle[32] = "";
+      if (size > 1)
+         snprintf(array_handle, sizeof(array_handle), "[%d]", size);
+
       assert(size < 256 && size >= 0);
-      if (size < ctx->key->num_indirect_generic_inputs) {
+      if (size < ctx->key->input.num_indirect_generic) {
          VREND_DEBUG(dbg_shader, NULL, "WARNING: shader key indicates less indirect inputs"
                                        " (%d) then are actually used (%d)\n",
-                     ctx->key->num_indirect_generic_inputs, size);
+                     ctx->key->input.num_indirect_generic, size);
       }
 
       if (prefer_generic_io_block(ctx, io_in)) {
@@ -6030,14 +6469,14 @@ static void emit_ios_indirect_generics_input(const struct dump_ctx *ctx,
          get_blockvarname(blockvarame, stage_prefix, &ctx->generic_ios.input_range.io,
                           postfix);
 
-         emit_hdrf(glsl_strbufs, "in %s {\n        vec4 %s[%d]; \n} %s;\n",
+         emit_hdrf(glsl_strbufs, "in %s {\n        vec4 %s%s; \n} %s;\n",
                    blockname, ctx->generic_ios.input_range.io.glsl_name,
-                   size, blockvarame);
+                   array_handle, blockvarame);
       } else
-         emit_hdrf(glsl_strbufs, "in vec4 %s%s[%d];\n",
+         emit_hdrf(glsl_strbufs, "in vec4 %s%s%s;\n",
                    ctx->generic_ios.input_range.io.glsl_name,
                    postfix,
-                   size);
+                   array_handle);
    }
 }
 
@@ -6059,13 +6498,11 @@ emit_ios_generic(const struct dump_ctx *ctx,
 
    char layout[128] = "";
 
+   if (io->overlapping_array)
+      return;
+
    if (io->layout_location > 0) {
-      /* we need to define a layout here because interleaved arrays might be emited */
-      if (io->swizzle_offset)
-         snprintf(layout, sizeof(layout), "layout(location = %d, component = %d)\n",
-                 io->layout_location - 1, io->swizzle_offset);
-      else
-         snprintf(layout, sizeof(layout), "layout(location = %d)\n", io->layout_location - 1);
+      snprintf(layout, sizeof(layout), "layout(location = %d)\n", io->layout_location - 1);
    }
 
    if (io->usage_mask != 0xf && io->name == TGSI_SEMANTIC_GENERIC)
@@ -6084,10 +6521,12 @@ emit_ios_generic(const struct dump_ctx *ctx,
                 postfix);
 
       if (io->name == TGSI_SEMANTIC_GENERIC) {
-         if (iot == io_in)
-            generic_ios->inputs_emitted_mask |= 1 << io->sid;
-         else
-            generic_ios->outputs_emitted_mask |= 1 << io->sid;
+         assert(io->sid < 64);
+         if (iot == io_in) {
+            generic_ios->inputs_emitted_mask |= 1ull << io->sid;
+         } else {
+            generic_ios->outputs_emitted_mask |= 1ull << io->sid;
+         }
       }
 
    } else {
@@ -6196,11 +6635,7 @@ emit_ios_patch(struct vrend_glsl_strbufs *glsl_strbufs,
 
    if (io->layout_location > 0) {
       /* we need to define a layout here because interleaved arrays might be emited */
-      if (io->swizzle_offset)
-         emit_hdrf(glsl_strbufs, "layout(location = %d, component = %d)\n",
-                 io->layout_location - 1, io->swizzle_offset);
-      else
-         emit_hdrf(glsl_strbufs, "layout(location = %d)\n", io->layout_location - 1);
+      emit_hdrf(glsl_strbufs, "layout(location = %d)\n", io->layout_location - 1);
    }
 
    if (io->usage_mask != 0xf)
@@ -6260,45 +6695,55 @@ static void emit_ios_vs(const struct dump_ctx *ctx,
          bcolor_emitted = front_back_color_emitted_flags[ctx->outputs[i].sid] & BACK_COLOR_EMITTED;
 
          if (fcolor_emitted && !bcolor_emitted) {
-            emit_hdrf(glsl_strbufs, "%sout vec4 ex_bc%d;\n", INTERP_PREFIX, ctx->outputs[i].sid);
+            emit_hdrf(glsl_strbufs, "%sout vec4 vso_bc%d;\n", INTERP_PREFIX, ctx->outputs[i].sid);
             front_back_color_emitted_flags[ctx->outputs[i].sid] |= BACK_COLOR_EMITTED;
          }
          if (bcolor_emitted && !fcolor_emitted) {
-            emit_hdrf(glsl_strbufs, "%sout vec4 ex_c%d;\n", INTERP_PREFIX, ctx->outputs[i].sid);
+            emit_hdrf(glsl_strbufs, "%sout vec4 vso_c%d;\n", INTERP_PREFIX, ctx->outputs[i].sid);
             front_back_color_emitted_flags[ctx->outputs[i].sid] |= FRONT_COLOR_EMITTED;
          }
       }
    }
 
+   if (ctx->key->vs.fog_fixup_mask)
+      emit_fog_fixup_hdr(ctx, glsl_strbufs);
+
    emit_winsys_correction(glsl_strbufs);
 
-   if (ctx->has_clipvertex) {
+   if (ctx->has_clipvertex && ctx->is_last_vertex_stage) {
       emit_hdrf(glsl_strbufs, "%svec4 clipv_tmp;\n", ctx->has_clipvertex_so ? "out " : "");
    }
-   if (ctx->num_clip_dist || ctx->key->clip_plane_enable) {
-      bool has_prop = (ctx->num_clip_dist_prop + ctx->num_cull_dist_prop) > 0;
-      int num_clip_dists = ctx->num_clip_dist ? ctx->num_clip_dist : 8;
-      int num_cull_dists = 0;
-      char cull_buf[64] = "";
-      char clip_buf[64] = "";
-      if (has_prop) {
-         num_clip_dists = ctx->num_clip_dist_prop;
-         num_cull_dists = ctx->num_cull_dist_prop;
-         if (num_clip_dists)
-            snprintf(clip_buf, 64, "out float gl_ClipDistance[%d];\n", num_clip_dists);
-         if (num_cull_dists)
-            snprintf(cull_buf, 64, "out float gl_CullDistance[%d];\n", num_cull_dists);
-      } else
+
+   char cull_buf[64] = "";
+   char clip_buf[64] = "";
+
+   if (ctx->cfg->has_cull_distance && (ctx->num_out_clip_dist || ctx->is_last_vertex_stage)) {
+      int num_clip_dists = ctx->num_clip_dist_prop ? ctx->num_clip_dist_prop : 0;
+      int num_cull_dists = ctx->num_cull_dist_prop ? ctx->num_cull_dist_prop : 0;
+
+      int num_clip_cull = num_clip_dists + num_cull_dists;
+      if (ctx->num_out_clip_dist && !num_clip_cull)
+         num_clip_dists = ctx->num_out_clip_dist;
+
+      if (num_clip_dists)
          snprintf(clip_buf, 64, "out float gl_ClipDistance[%d];\n", num_clip_dists);
-      if (ctx->key->clip_plane_enable) {
+      if (num_cull_dists)
+         snprintf(cull_buf, 64, "out float gl_CullDistance[%d];\n", num_cull_dists);
+
+      if (ctx->is_last_vertex_stage) {
+         emit_hdr(glsl_strbufs, "uniform bool clip_plane_enabled;\n");
          emit_hdr(glsl_strbufs, "uniform vec4 clipp[8];\n");
-      }
-      if ((ctx->key->gs_present || ctx->key->tes_present) && ctx->key->next_stage_pervertex_in) {
-         emit_hdrf(glsl_strbufs, "out gl_PerVertex {\n vec4 gl_Position;\n %s%s};\n", clip_buf, cull_buf);
-      } else {
+
          emit_hdrf(glsl_strbufs, "%s%s", clip_buf, cull_buf);
       }
-      emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
+
+      emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");      
+   }
+
+   const char *psize_buf = ctx->has_pointsize_output ? "out float gl_PointSize;\n" : "";
+
+   if (!ctx->is_last_vertex_stage && ctx->key->output.use_pervertex) {
+      emit_hdrf(glsl_strbufs, "out gl_PerVertex {\n vec4 gl_Position;\n %s%s%s};\n", clip_buf, cull_buf, psize_buf);
    }
 }
 
@@ -6326,7 +6771,7 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
    uint32_t i;
 
    if (fs_emit_layout(ctx)) {
-      bool upper_left = !(ctx->fs_coord_origin ^ ctx->key->invert_fs_origin);
+      bool upper_left = !(ctx->fs_coord_origin ^ ctx->key->fs.invert_origin);
       char comma = (upper_left && ctx->fs_pixel_center) ? ',' : ' ';
 
       if (!ctx->cfg->use_gles)
@@ -6346,6 +6791,24 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
          const char *prefix = "";
          const char *auxprefix = "";
 
+         if (ctx->cfg->use_gles) {
+            if (ctx->inputs[i].name == TGSI_SEMANTIC_COLOR) {
+               if (!(ctx->key->fs.available_color_in_bits & (1 << ctx->inputs[i].sid))) {
+                  emit_hdrf(glsl_strbufs, "vec4 %s = vec4(0.0, 0.0, 0.0, 0.0);\n",
+                            ctx->inputs[i].glsl_name);
+                  continue;
+               }
+            }
+
+            if (ctx->inputs[i].name == TGSI_SEMANTIC_BCOLOR) {
+               if (!(ctx->key->fs.available_color_in_bits & (1 << ctx->inputs[i].sid) << 2)) {
+                  emit_hdrf(glsl_strbufs, "vec4 %s = vec4(0.0, 0.0, 0.0, 0.0);\n",
+                            ctx->inputs[i].glsl_name);
+                  continue;
+               }
+            }
+         }
+
          if (ctx->inputs[i].name == TGSI_SEMANTIC_GENERIC ||
               ctx->inputs[i].name == TGSI_SEMANTIC_COLOR ||
               ctx->inputs[i].name == TGSI_SEMANTIC_BCOLOR) {
@@ -6362,14 +6825,16 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
       }
 
       if (ctx->cfg->use_gles && !ctx->winsys_adjust_y_emitted &&
-          (ctx->key->coord_replace & (1 << ctx->inputs[i].sid))) {
+          (ctx->inputs[i].name == TGSI_SEMANTIC_PCOORD ||
+          (ctx->key->fs.coord_replace & (1 << ctx->inputs[i].sid)))){
          *winsys_adjust_y_emitted = true;
          emit_hdr(glsl_strbufs, "uniform float winsys_adjust_y;\n");
       }
    }
 
-   if (vrend_shader_needs_alpha_func(ctx->key)) {
-      emit_hdr(glsl_strbufs, "uniform float alpha_ref_val;\n");
+   if (ctx->cfg->use_core_profile) {
+       emit_hdr(glsl_strbufs, "uniform float alpha_ref_val;\n");
+       emit_hdr(glsl_strbufs, "uniform int alpha_func;\n");
    }
 
    if (ctx->key->color_two_side) {
@@ -6387,18 +6852,18 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
 
    if (ctx->write_all_cbufs) {
       const char* type = "vec4";
-      if (ctx->key->cbufs_unsigned_int_bitmask)
+      if (ctx->key->fs.cbufs_unsigned_int_bitmask)
          type = "uvec4";
-      else if (ctx->key->cbufs_signed_int_bitmask)
+      else if (ctx->key->fs.cbufs_signed_int_bitmask)
          type = "ivec4";
 
       for (i = 0; i < (uint32_t)ctx->cfg->max_draw_buffers; i++) {
          if (ctx->cfg->use_gles) {
-            if (ctx->key->fs_logicop_enabled)
+            if (ctx->key->fs.logicop_enabled)
                emit_hdrf(glsl_strbufs, "%s fsout_tmp_c%d;\n", type, i);
 
             if (logiop_require_inout(ctx->key)) {
-               const char *noncoherent = ctx->key->fs_logicop_emulate_coherent ? "" : ", noncoherent";
+               const char *noncoherent = ctx->cfg->has_fbfetch_coherent ? "" : ", noncoherent";
                emit_hdrf(glsl_strbufs, "layout (location=%d%s) inout highp %s fsout_c%d;\n", i, noncoherent, type, i);
             } else
                emit_hdrf(glsl_strbufs, "layout (location=%d) out %s fsout_c%d;\n", i,
@@ -6437,14 +6902,14 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
    }
 
    if (ctx->num_in_clip_dist) {
-      if (ctx->key->prev_stage_num_clip_out) {
-         emit_hdrf(glsl_strbufs, "in float gl_ClipDistance[%d];\n", ctx->key->prev_stage_num_clip_out);
-      } else if (ctx->num_in_clip_dist > 4 && !ctx->key->prev_stage_num_cull_out) {
+      if (ctx->key->num_in_clip) {
+         emit_hdrf(glsl_strbufs, "in float gl_ClipDistance[%d];\n", ctx->key->num_in_clip);
+      } else if (ctx->num_in_clip_dist > 4 && !ctx->key->num_in_cull) {
          emit_hdrf(glsl_strbufs, "in float gl_ClipDistance[%d];\n", ctx->num_in_clip_dist);
       }
 
-      if (ctx->key->prev_stage_num_cull_out) {
-         emit_hdrf(glsl_strbufs, "in float gl_CullDistance[%d];\n", ctx->key->prev_stage_num_cull_out);
+      if (ctx->key->num_in_cull) {
+         emit_hdrf(glsl_strbufs, "in float gl_CullDistance[%d];\n", ctx->key->num_in_cull);
       }
       if(ctx->fs_uses_clipdist_input)
          emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
@@ -6455,6 +6920,66 @@ static bool
 can_emit_generic_geom(const struct vrend_shader_io *io)
 {
    return io->stream == 0;
+}
+
+static void emit_ios_per_vertex_in(const struct dump_ctx *ctx,
+                                   struct vrend_glsl_strbufs *glsl_strbufs,
+                                   bool *has_pervertex)
+{
+   char clip_var[64] = "";
+   char cull_var[64] = "";
+
+   if (ctx->num_in_clip_dist) {
+      int clip_dist, cull_dist;
+
+      clip_dist = ctx->key->num_in_clip;
+      cull_dist = ctx->key->num_in_cull;
+
+      int num_clip_cull = clip_dist + cull_dist;
+      if (ctx->num_in_clip_dist && !num_clip_cull)
+         clip_dist = ctx->num_in_clip_dist;
+
+      if (clip_dist)
+         snprintf(clip_var, 64, "float gl_ClipDistance[%d];\n", clip_dist);
+      if (cull_dist)
+         snprintf(cull_var, 64, "float gl_CullDistance[%d];\n", cull_dist);
+
+      (*has_pervertex) = true;
+      emit_hdrf(glsl_strbufs, "in gl_PerVertex {\n vec4 gl_Position; \n %s%s%s\n} gl_in[];\n",
+                clip_var, cull_var, ctx->has_pointsize_input ? "float gl_PointSize;\n" : "");
+
+   }
+
+}
+
+
+static void emit_ios_per_vertex_out(const struct dump_ctx *ctx,
+                                    struct vrend_glsl_strbufs *glsl_strbufs, const char *instance_var)
+{
+   int clip_dist = ctx->num_clip_dist_prop ? ctx->num_clip_dist_prop : ctx->key->num_out_clip;
+   int cull_dist = ctx->num_cull_dist_prop ? ctx->num_cull_dist_prop : ctx->key->num_out_cull;
+   int num_clip_cull = clip_dist + cull_dist;
+
+   if (ctx->num_out_clip_dist && !num_clip_cull)
+      clip_dist = ctx->num_out_clip_dist;
+
+   if (ctx->key->output.use_pervertex) {
+      char clip_var[64] = "", cull_var[64] = "";
+      if (cull_dist)
+         snprintf(cull_var, 64, "float gl_CullDistance[%d];\n", cull_dist);
+
+      if (clip_dist)
+         snprintf(clip_var, 64, "float gl_ClipDistance[%d];\n", clip_dist);
+
+      emit_hdrf(glsl_strbufs, "out gl_PerVertex {\n vec4 gl_Position; \n %s%s%s\n} %s;\n",
+                clip_var, cull_var,
+                ctx->has_pointsize_output ? "float gl_PointSize;\n" : "",
+                instance_var);
+   }
+
+   if (clip_dist + cull_dist > 0)
+      emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
+
 }
 
 static void emit_ios_geom(const struct dump_ctx *ctx,
@@ -6506,44 +7031,41 @@ static void emit_ios_geom(const struct dump_ctx *ctx,
       }
    }
 
+   emit_ios_indirect_generics_output(ctx, glsl_strbufs, "");
+
    emit_ios_generic_outputs(ctx, glsl_strbufs, generic_ios, front_back_color_emitted_flags,
                             force_color_two_side, num_interps, can_emit_generic_geom);
 
    emit_winsys_correction(glsl_strbufs);
 
-   if (ctx->num_in_clip_dist || ctx->key->clip_plane_enable) {
-      int clip_dist, cull_dist;
-      char clip_var[64] = "";
-      char cull_var[64] = "";
+   emit_ios_per_vertex_in(ctx, glsl_strbufs, has_pervertex);
 
-      clip_dist = ctx->key->prev_stage_num_clip_out ? ctx->key->prev_stage_num_clip_out : ctx->num_in_clip_dist;
-      cull_dist = ctx->key->prev_stage_num_cull_out;
-
-      if (clip_dist)
-         snprintf(clip_var, 64, "float gl_ClipDistance[%d];\n", clip_dist);
-      if (cull_dist)
-         snprintf(cull_var, 64, "float gl_CullDistance[%d];\n", cull_dist);
-
-      (*has_pervertex) = true;
-      emit_hdrf(glsl_strbufs, "in gl_PerVertex {\n vec4 gl_Position; \n %s%s\n} gl_in[];\n", clip_var, cull_var);
+   if (ctx->has_clipvertex) {
+      emit_hdrf(glsl_strbufs, "%svec4 clipv_tmp;\n", ctx->has_clipvertex_so ? "out " : "");
    }
-   if (ctx->num_clip_dist) {
-      bool has_prop = (ctx->num_clip_dist_prop + ctx->num_cull_dist_prop) > 0;
-      int num_clip_dists = ctx->num_clip_dist ? ctx->num_clip_dist : 8;
-      int num_cull_dists = 0;
+
+   if (ctx->num_out_clip_dist) {
+      bool has_clip_or_cull_prop = ctx->num_clip_dist_prop + ctx->num_cull_dist_prop > 0;
+
+      int num_clip_dists = has_clip_or_cull_prop ? ctx->num_clip_dist_prop :
+                                                   (ctx->num_out_clip_dist ? ctx->num_out_clip_dist : 8);
+      int num_cull_dists = has_clip_or_cull_prop ? ctx->num_cull_dist_prop : 0;
+
       char cull_buf[64] = "";
       char clip_buf[64] = "";
-      if (has_prop) {
-         num_clip_dists = ctx->num_clip_dist_prop;
-         num_cull_dists = ctx->num_cull_dist_prop;
-         if (num_clip_dists)
-            snprintf(clip_buf, 64, "out float gl_ClipDistance[%d];\n", num_clip_dists);
-         if (num_cull_dists)
-            snprintf(cull_buf, 64, "out float gl_CullDistance[%d];\n", num_cull_dists);
-      } else
+
+      if (num_clip_dists)
          snprintf(clip_buf, 64, "out float gl_ClipDistance[%d];\n", num_clip_dists);
+      if (num_cull_dists)
+         snprintf(cull_buf, 64, "out float gl_CullDistance[%d];\n", num_cull_dists);
+
       emit_hdrf(glsl_strbufs, "%s%s\n", clip_buf, cull_buf);
       emit_hdrf(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
+   }
+
+   if (ctx->cfg->has_cull_distance) {
+       emit_hdr(glsl_strbufs, "uniform bool clip_plane_enabled;\n");
+       emit_hdr(glsl_strbufs, "uniform vec4 clipp[8];\n");
    }
 }
 
@@ -6572,7 +7094,7 @@ static void emit_ios_tcs(const struct dump_ctx *ctx,
 
    if (ctx->patch_ios.output_range.used)
       emit_ios_patch(glsl_strbufs, "patch", &ctx->patch_ios.output_range.io, "out",
-                     ctx->patch_ios.output_range.io.last - ctx->patch_ios.output_range.io.sid + 1);
+                     ctx->patch_ios.output_range.io.last - ctx->patch_ios.output_range.io.first + 1);
 
    for (i = 0; i < ctx->num_outputs; i++) {
       if (!ctx->outputs[i].glsl_predefined_no_emit) {
@@ -6589,25 +7111,8 @@ static void emit_ios_tcs(const struct dump_ctx *ctx,
       }
    }
 
-   if (ctx->num_in_clip_dist) {
-      int clip_dist, cull_dist;
-      char clip_var[64] = "", cull_var[64] = "";
-
-      clip_dist = ctx->key->prev_stage_num_clip_out ? ctx->key->prev_stage_num_clip_out : ctx->num_in_clip_dist;
-      cull_dist = ctx->key->prev_stage_num_cull_out;
-
-      if (clip_dist)
-         snprintf(clip_var, 64, "float gl_ClipDistance[%d];\n", clip_dist);
-      if (cull_dist)
-         snprintf(cull_var, 64, "float gl_CullDistance[%d];\n", cull_dist);
-
-      *has_pervertex = true;
-      emit_hdrf(glsl_strbufs, "in gl_PerVertex {\n vec4 gl_Position; \n %s%s} gl_in[];\n", clip_var, cull_var);
-   }
-   if (ctx->num_clip_dist && ctx->key->next_stage_pervertex_in) {
-      emit_hdrf(glsl_strbufs, "out gl_PerVertex {\n vec4 gl_Position;\n float gl_ClipDistance[%d];\n} gl_out[];\n", ctx->num_clip_dist);
-      emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
-   }
+   emit_ios_per_vertex_in(ctx, glsl_strbufs, has_pervertex);
+   emit_ios_per_vertex_out(ctx, glsl_strbufs, " gl_out[]");
 }
 
 static void emit_ios_tes(const struct dump_ctx *ctx,
@@ -6622,7 +7127,7 @@ static void emit_ios_tes(const struct dump_ctx *ctx,
 
    if (ctx->patch_ios.input_range.used)
       emit_ios_patch(glsl_strbufs, "patch", &ctx->patch_ios.input_range.io, "in",
-                     ctx->patch_ios.input_range.io.last - ctx->patch_ios.input_range.io.sid + 1);
+                     ctx->patch_ios.input_range.io.last - ctx->patch_ios.input_range.io.first + 1);
 
    if (generic_ios->input_range.used)
       emit_ios_indirect_generics_input(ctx, glsl_strbufs, "[]");
@@ -6643,30 +7148,25 @@ static void emit_ios_tes(const struct dump_ctx *ctx,
              ctx->tes_vertex_order ? "cw" : "ccw",
              ctx->tes_point_mode ? ", point_mode" : "");
 
+   emit_ios_indirect_generics_output(ctx, glsl_strbufs, "");
+
    emit_ios_generic_outputs(ctx, glsl_strbufs, generic_ios, front_back_color_emitted_flags,
                             force_color_two_side, num_interps, can_emit_generic_default);
 
    emit_winsys_correction(glsl_strbufs);
 
-   if (ctx->num_in_clip_dist) {
-      int clip_dist, cull_dist;
-      char clip_var[64] = "", cull_var[64] = "";
+   emit_ios_per_vertex_in(ctx, glsl_strbufs, has_pervertex);
+   emit_ios_per_vertex_out(ctx, glsl_strbufs, "");
 
-      clip_dist = ctx->key->prev_stage_num_clip_out ? ctx->key->prev_stage_num_clip_out : ctx->num_in_clip_dist;
-      cull_dist = ctx->key->prev_stage_num_cull_out;
-
-      if (clip_dist)
-         snprintf(clip_var, 64, "float gl_ClipDistance[%d];\n", clip_dist);
-      if (cull_dist)
-         snprintf(cull_var, 64, "float gl_CullDistance[%d];\n", cull_dist);
-
-      *has_pervertex = true;
-      emit_hdrf(glsl_strbufs, "in gl_PerVertex {\n vec4 gl_Position; \n %s%s} gl_in[];\n", clip_var, cull_var);
+   if (ctx->cfg->has_cull_distance && ctx->is_last_vertex_stage) {
+      emit_hdr(glsl_strbufs, "uniform bool clip_plane_enabled;\n");
+      emit_hdr(glsl_strbufs, "uniform vec4 clipp[8];\n");
    }
-   if (ctx->num_clip_dist && ctx->key->next_stage_pervertex_in) {
-      emit_hdrf(glsl_strbufs, "out gl_PerVertex {\n vec4 gl_Position;\n float gl_ClipDistance[%d];\n} gl_out[];\n", ctx->num_clip_dist);
-      emit_hdr(glsl_strbufs, "vec4 clip_dist_temp[2];\n");
+
+   if (ctx->has_clipvertex && !ctx->key->gs_present) {
+      emit_hdrf(glsl_strbufs, "%svec4 clipv_tmp;\n", ctx->has_clipvertex_so ? "out " : "");
    }
+
 }
 
 
@@ -6721,15 +7221,15 @@ static int emit_ios(const struct dump_ctx *ctx,
       emit_ios_cs(ctx, glsl_strbufs);
       break;
    default:
-      fprintf(stderr, "Unknown shader processor %d\n", ctx->prog_type);
+      vrend_printf("Unknown shader processor %d\n", ctx->prog_type);
       set_hdr_error(glsl_strbufs);
       return glsl_ver_required;
    }
 
    if (generic_ios->outputs_expected_mask &&
        (generic_ios->outputs_expected_mask != generic_ios->outputs_emitted_mask)) {
-      for (int i = 0; i < 31; ++i) {
-         uint32_t mask = 1 << i;
+      for (int i = 0; i < 64; ++i) {
+         uint64_t mask = 1ull << i;
          bool expecting = generic_ios->outputs_expected_mask & mask;
          if (expecting & !(generic_ios->outputs_emitted_mask & mask))
             emit_hdrf(glsl_strbufs, "                              out vec4 %s_g%dA0_f%s;\n",
@@ -6749,7 +7249,7 @@ static int emit_ios(const struct dump_ctx *ctx,
    return glsl_ver_required;
 }
 
-static boolean fill_fragment_interpolants(const struct dump_ctx *ctx, struct vrend_shader_info *sinfo)
+static boolean fill_fragment_interpolants(const struct dump_ctx *ctx, struct vrend_fs_shader_info *fs_info)
 {
    uint32_t i, index = 0;
 
@@ -6765,37 +7265,23 @@ static boolean fill_fragment_interpolants(const struct dump_ctx *ctx, struct vre
          vrend_printf( "mismatch in number of interps %d %d\n", index, ctx->num_interps);
          return true;
       }
-      sinfo->interpinfo[index].semantic_name = ctx->inputs[i].name;
-      sinfo->interpinfo[index].semantic_index = ctx->inputs[i].sid;
-      sinfo->interpinfo[index].interpolate = ctx->inputs[i].interpolate;
-      sinfo->interpinfo[index].location = ctx->inputs[i].location;
+      fs_info->interpinfo[index].semantic_name = ctx->inputs[i].name;
+      fs_info->interpinfo[index].semantic_index = ctx->inputs[i].sid;
+      fs_info->interpinfo[index].interpolate = ctx->inputs[i].interpolate;
+      fs_info->interpinfo[index].location = ctx->inputs[i].location;
       index++;
    }
    return true;
 }
 
-static boolean fill_interpolants(const struct dump_ctx *ctx, struct vrend_shader_info *sinfo)
+static boolean fill_interpolants(const struct dump_ctx *ctx, struct vrend_variable_shader_info *sinfo)
 {
-   boolean ret;
-
    if (!ctx->num_interps)
       return true;
    if (ctx->prog_type == TGSI_PROCESSOR_VERTEX || ctx->prog_type == TGSI_PROCESSOR_GEOMETRY)
       return true;
 
-   free(sinfo->interpinfo);
-   sinfo->interpinfo = calloc(ctx->num_interps, sizeof(struct vrend_interp_info));
-   if (!sinfo->interpinfo)
-      return false;
-
-   ret = fill_fragment_interpolants(ctx, sinfo);
-   if (ret == false)
-      goto out_fail;
-
-   return true;
- out_fail:
-   free(sinfo->interpinfo);
-   return false;
+   return fill_fragment_interpolants(ctx, &sinfo->fs_info);
 }
 
 static boolean analyze_instruction(struct tgsi_iterate_context *iter,
@@ -6830,38 +7316,52 @@ static boolean analyze_instruction(struct tgsi_iterate_context *iter,
    return true;
 }
 
+static void fill_var_sinfo(const struct dump_ctx *ctx, struct vrend_variable_shader_info *sinfo)
+{
+   sinfo->num_ucp = ctx->is_last_vertex_stage ? VIRGL_NUM_CLIP_PLANES : 0;
+   sinfo->fs_info.has_sample_input = ctx->has_sample_input;
+   sinfo->fs_info.num_interps = ctx->num_interps;
+   sinfo->fs_info.glsl_ver = ctx->glsl_ver_required;
+   bool has_prop = (ctx->num_clip_dist_prop + ctx->num_cull_dist_prop) > 0;
+
+   sinfo->num_in_clip = has_prop ? ctx->num_clip_dist_prop : ctx->key->num_in_clip;
+   sinfo->num_in_cull = has_prop ? ctx->num_cull_dist_prop : ctx->key->num_in_cull;
+   sinfo->num_out_clip = has_prop ? ctx->num_clip_dist_prop : ctx->key->num_out_clip;
+   sinfo->num_out_cull = has_prop ? ctx->num_cull_dist_prop : ctx->key->num_out_cull;
+   sinfo->legacy_color_bits = ctx->color_out_mask;
+}
+
 static void fill_sinfo(const struct dump_ctx *ctx, struct vrend_shader_info *sinfo)
 {
-   sinfo->num_ucp = ctx->key->clip_plane_enable ? 8 : 0;
-   sinfo->has_pervertex_in = ctx->has_pervertex;
-   sinfo->has_sample_input = ctx->has_sample_input;
-   bool has_prop = (ctx->num_clip_dist_prop + ctx->num_cull_dist_prop) > 0;
-   sinfo->num_clip_out = has_prop ? ctx->num_clip_dist_prop : (ctx->num_clip_dist ? ctx->num_clip_dist : 8);
-   sinfo->num_cull_out = has_prop ? ctx->num_cull_dist_prop : 0;
+   sinfo->in.use_pervertex = ctx->has_pervertex;
    sinfo->samplers_used_mask = ctx->samplers_used;
    sinfo->images_used_mask = ctx->images_used_mask;
    sinfo->num_consts = ctx->num_consts;
    sinfo->ubo_used_mask = ctx->ubo_used_mask;
+   sinfo->fog_input_mask = ctx->fog_input_mask;
+   sinfo->fog_output_mask = ctx->fog_output_mask;
 
    sinfo->ssbo_used_mask = ctx->ssbo_used_mask;
 
-   sinfo->ubo_indirect = ctx->info.dimension_indirect_files & (1 << TGSI_FILE_CONSTANT);
+   sinfo->ubo_indirect = !!(ctx->info.dimension_indirect_files & (1 << TGSI_FILE_CONSTANT));
 
    if (ctx->generic_ios.input_range.used)
-      sinfo->num_indirect_generic_inputs = ctx->generic_ios.input_range.io.last - ctx->generic_ios.input_range.io.sid + 1;
+      sinfo->in.num_indirect_generic = ctx->generic_ios.input_range.io.last -
+         ctx->generic_ios.input_range.io.first + 1;
    if (ctx->patch_ios.input_range.used)
-      sinfo->num_indirect_patch_inputs = ctx->patch_ios.input_range.io.last - ctx->patch_ios.input_range.io.sid + 1;
+      sinfo->in.num_indirect_patch = ctx->patch_ios.input_range.io.last -
+         ctx->patch_ios.input_range.io.first + 1;
 
    if (ctx->generic_ios.output_range.used)
-      sinfo->num_indirect_generic_outputs = ctx->generic_ios.output_range.io.last - ctx->generic_ios.output_range.io.sid + 1;
+      sinfo->out.num_indirect_generic = ctx->generic_ios.output_range.io.last -
+         ctx->generic_ios.output_range.io.first + 1;
    if (ctx->patch_ios.output_range.used)
-      sinfo->num_indirect_patch_outputs = ctx->patch_ios.output_range.io.last - ctx->patch_ios.output_range.io.sid + 1;
+      sinfo->out.num_indirect_patch = ctx->patch_ios.output_range.io.last -
+         ctx->patch_ios.output_range.io.first + 1;
 
    sinfo->num_inputs = ctx->num_inputs;
-   sinfo->num_interps = ctx->num_interps;
    sinfo->num_outputs = ctx->num_outputs;
    sinfo->shadow_samp_mask = ctx->shadow_samp_mask;
-   sinfo->glsl_ver = ctx->glsl_ver_required;
    sinfo->gs_out_prim = ctx->gs_out_prim;
    sinfo->tes_prim = ctx->tes_prim_mode;
    sinfo->tes_point_mode = ctx->tes_point_mode;
@@ -6879,16 +7379,24 @@ static void fill_sinfo(const struct dump_ctx *ctx, struct vrend_shader_info *sin
     * to the next shader stage. mesa/tgsi doesn't provide this information for
     * TCS, TES, and GEOM shaders.
     */
-   sinfo->guest_sent_io_arrays = ctx->guest_sent_io_arrays;
-   sinfo->num_generic_and_patch_outputs = 0;
+   sinfo->out.guest_sent_io_arrays = ctx->guest_sent_io_arrays;
+   sinfo->out.num_generic_and_patch = 0;
    for(unsigned i = 0; i < ctx->num_outputs; i++) {
-         sinfo->generic_outputs_layout[sinfo->num_generic_and_patch_outputs].name = ctx->outputs[i].name;
-         sinfo->generic_outputs_layout[sinfo->num_generic_and_patch_outputs].sid = ctx->outputs[i].sid;
-         sinfo->generic_outputs_layout[sinfo->num_generic_and_patch_outputs].location = ctx->outputs[i].layout_location;
-         sinfo->generic_outputs_layout[sinfo->num_generic_and_patch_outputs].array_id = ctx->outputs[i].array_id;
-         sinfo->generic_outputs_layout[sinfo->num_generic_and_patch_outputs].usage_mask = ctx->outputs[i].usage_mask;
-         if (ctx->outputs[i].name == TGSI_SEMANTIC_GENERIC || ctx->outputs[i].name == TGSI_SEMANTIC_PATCH) {
-            sinfo->num_generic_and_patch_outputs++;
+      if ((ctx->outputs[i].name == TGSI_SEMANTIC_GENERIC || ctx->outputs[i].name == TGSI_SEMANTIC_PATCH) &&
+          !ctx->outputs[i].overlapping_array) {
+         sinfo->generic_outputs_layout[sinfo->out.num_generic_and_patch].name = ctx->outputs[i].name;
+         sinfo->generic_outputs_layout[sinfo->out.num_generic_and_patch].sid = ctx->outputs[i].sid;
+         sinfo->generic_outputs_layout[sinfo->out.num_generic_and_patch].location = ctx->outputs[i].layout_location;
+         sinfo->generic_outputs_layout[sinfo->out.num_generic_and_patch].array_id = ctx->outputs[i].array_id;
+         sinfo->generic_outputs_layout[sinfo->out.num_generic_and_patch].usage_mask = ctx->outputs[i].usage_mask;
+         sinfo->out.num_generic_and_patch++;
+      }
+
+      if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT) {
+         if (ctx->outputs[i].name == TGSI_SEMANTIC_COLOR)
+            sinfo->fs_output_layout[i] = ctx->outputs[i].sid;
+         else
+            sinfo->fs_output_layout[i] = -1;
       }
    }
 
@@ -6902,12 +7410,17 @@ static void fill_sinfo(const struct dump_ctx *ctx, struct vrend_shader_info *sin
       free(sinfo->image_arrays);
    sinfo->image_arrays = ctx->image_arrays;
    sinfo->num_image_arrays = ctx->num_image_arrays;
-   sinfo->generic_inputs_emitted_mask = ctx->generic_ios.inputs_emitted_mask;
+   sinfo->in.generic_emitted_mask = ctx->generic_ios.inputs_emitted_mask;
 
    for (unsigned i = 0; i < ctx->num_outputs; ++i) {
-      if (ctx->outputs[i].invariant)
-         sinfo->invariant_outputs |= 1ull << ctx->outputs[i].sid;
+      if (ctx->outputs[i].invariant) {
+         uint32_t bit_pos = varying_bit_from_semantic_and_index(ctx->outputs[i].name, ctx->outputs[i].sid);
+         uint32_t slot = bit_pos / 32;
+         uint32_t bit = 1u << (bit_pos & 0x1f);
+         sinfo->invariant_outputs[slot] |= bit;
+      }
    }
+   sinfo->gles_use_tex_query_level = ctx->gles_use_tex_query_level;
 }
 
 static bool allocate_strbuffers(struct vrend_glsl_strbufs* glsl_strbufs)
@@ -6927,24 +7440,31 @@ static bool allocate_strbuffers(struct vrend_glsl_strbufs* glsl_strbufs)
    return true;
 }
 
-static void set_strbuffers(MAYBE_UNUSED const struct vrend_context *rctx, const struct vrend_glsl_strbufs* glsl_strbufs,
+static void set_strbuffers(const struct vrend_glsl_strbufs* glsl_strbufs,
                            struct vrend_strarray *shader)
 {
    strarray_addstrbuf(shader, &glsl_strbufs->glsl_ver_ext);
    strarray_addstrbuf(shader, &glsl_strbufs->glsl_hdr);
    strarray_addstrbuf(shader, &glsl_strbufs->glsl_main);
-   VREND_DEBUG(dbg_shader_glsl, rctx, "GLSL:");
-   VREND_DEBUG_EXT(dbg_shader_glsl, rctx, strarray_dump(shader));
-   VREND_DEBUG(dbg_shader_glsl, rctx, "\n");
 }
 
-static bool vrend_patch_vertex_shader_interpolants(MAYBE_UNUSED const struct vrend_context *rctx,
-                                            const struct vrend_shader_cfg *cfg,
+static bool vrend_patch_vertex_shader_interpolants(const struct vrend_shader_cfg *cfg,
                                             struct vrend_strarray *prog_strings,
                                             const struct vrend_shader_info *vs_info,
-                                            const struct vrend_shader_info *fs_info,
+                                            const struct vrend_fs_shader_info *fs_info,
                                             const char *oprefix,
                                             bool flatshade);
+
+static int compare_sid(const void *lhs, const void *rhs)
+{
+   const struct vrend_shader_io *l = (struct vrend_shader_io *)lhs;
+   const struct vrend_shader_io *r = (struct vrend_shader_io *)rhs;
+
+   if (l->name != r->name)
+      return l->name - r->name;
+
+   return l->sid - r->sid;
+}
 
 bool vrend_convert_shader(const struct vrend_context *rctx,
                           const struct vrend_shader_cfg *cfg,
@@ -6952,6 +7472,7 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
                           uint32_t req_local_mem,
                           const struct vrend_shader_key *key,
                           struct vrend_shader_info *sinfo,
+                          struct vrend_variable_shader_info *var_sinfo,
                           struct vrend_strarray *shader)
 {
    struct dump_ctx ctx;
@@ -6960,12 +7481,16 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
    memset(&ctx, 0, sizeof(struct dump_ctx));
 
    /* First pass to deal with edge cases. */
-   if (ctx.prog_type == TGSI_PROCESSOR_FRAGMENT)
-      ctx.iter.iterate_declaration = iter_inputs;
+   ctx.iter.iterate_declaration = iter_decls;
    ctx.iter.iterate_instruction = analyze_instruction;
    bret = tgsi_iterate_shader(tokens, &ctx.iter);
    if (bret == false)
       return false;
+
+   ctx.is_last_vertex_stage =
+         (ctx.iter.processor.Processor == TGSI_PROCESSOR_GEOMETRY) ||
+         (ctx.iter.processor.Processor == TGSI_PROCESSOR_TESS_EVAL && !key->gs_present) ||
+         (ctx.iter.processor.Processor == TGSI_PROCESSOR_VERTEX &&  !key->gs_present && !key->tes_present);
 
    ctx.num_inputs = 0;
 
@@ -6986,8 +7511,8 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
    ctx.ssbo_atomic_array_base = 0xffffffff;
    ctx.has_sample_input = false;
    ctx.req_local_mem = req_local_mem;
-   ctx.guest_sent_io_arrays = key->guest_sent_io_arrays;
-   ctx.generic_ios.outputs_expected_mask = key->generic_outputs_expected_mask;
+   ctx.guest_sent_io_arrays = key->input.guest_sent_io_arrays;
+   ctx.generic_ios.outputs_expected_mask = key->output.generic_emitted_mask;
 
    tgsi_scan_shader(tokens, &ctx.info);
    /* if we are in core profile mode we should use GLSL 1.40 */
@@ -7023,6 +7548,9 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
    for (size_t i = 0; i < ARRAY_SIZE(ctx.src_bufs); ++i)
       strbuf_free(ctx.src_bufs + i);
 
+   if (ctx.prog_type == TGSI_PROCESSOR_FRAGMENT)
+      qsort(ctx.outputs, ctx.num_outputs, sizeof(struct vrend_shader_io), compare_sid);
+
    emit_header(&ctx, &ctx.glsl_strbufs);
    ctx.glsl_ver_required = emit_ios(&ctx, &ctx.glsl_strbufs, &ctx.generic_ios,
                                     ctx.front_back_color_emitted_flags,
@@ -7034,39 +7562,42 @@ bool vrend_convert_shader(const struct vrend_context *rctx,
    if (strbuf_get_error(&ctx.glsl_strbufs.glsl_hdr))
       goto fail;
 
-   bret = fill_interpolants(&ctx, sinfo);
+   bret = fill_interpolants(&ctx, var_sinfo);
    if (bret == false)
       goto fail;
 
    free(ctx.temp_ranges);
 
    fill_sinfo(&ctx, sinfo);
-   set_strbuffers(rctx, &ctx.glsl_strbufs, shader);
+   fill_var_sinfo(&ctx, var_sinfo);
+
+   set_strbuffers(&ctx.glsl_strbufs, shader);
 
    if (ctx.prog_type == TGSI_PROCESSOR_GEOMETRY) {
-       vrend_patch_vertex_shader_interpolants(rctx,
-					      cfg,
-					      shader,
-					      sinfo,
-					      key->fs_info, "gso",
-					      key->flatshade);
+      vrend_patch_vertex_shader_interpolants(cfg,
+                                             shader,
+                                             sinfo,
+                                             &key->fs_info, "gso",
+                                             key->flatshade);
    } else if (!key->gs_present &&
               ctx.prog_type == TGSI_PROCESSOR_TESS_EVAL) {
-       vrend_patch_vertex_shader_interpolants(rctx,
-					      cfg,
-					      shader,
-					      sinfo,
-					      key->fs_info, "teo",
-					      key->flatshade);
+      vrend_patch_vertex_shader_interpolants(cfg,
+                                             shader,
+                                             sinfo,
+                                             &key->fs_info, "teo",
+                                             key->flatshade);
    } else if (!key->gs_present && !key->tes_present &&
-	      ctx.prog_type == TGSI_PROCESSOR_VERTEX) {
-       vrend_patch_vertex_shader_interpolants(rctx,
-					      cfg,
-					      shader,
-					      sinfo,
-					      key->fs_info, "vso",
-					      key->flatshade);
+              ctx.prog_type == TGSI_PROCESSOR_VERTEX) {
+      vrend_patch_vertex_shader_interpolants(cfg,
+                                             shader,
+                                             sinfo,
+                                             &key->fs_info, "vso",
+                                             key->flatshade);
    }
+
+   VREND_DEBUG(dbg_shader_glsl, rctx, "GLSL:");
+   VREND_DEBUG_EXT(dbg_shader_glsl, rctx, strarray_dump(shader));
+   VREND_DEBUG(dbg_shader_glsl, rctx, "\n");
 
    return true;
  fail:
@@ -7116,11 +7647,11 @@ static void require_gpu_shader5_and_msinterp(struct vrend_strarray *program)
    strbuf_append(&program->strings[SHADER_STRING_VER_EXT], gpu_shader5_and_msinterp_string);
 }
 
-static bool vrend_patch_vertex_shader_interpolants(MAYBE_UNUSED const struct vrend_context *rctx,
+static bool vrend_patch_vertex_shader_interpolants(
                                             const struct vrend_shader_cfg *cfg,
                                             struct vrend_strarray *prog_strings,
                                             const struct vrend_shader_info *vs_info,
-                                            const struct vrend_shader_info *fs_info,
+                                            const struct vrend_fs_shader_info *fs_info,
                                             const char *oprefix, bool flatshade)
 {
    int i;
@@ -7129,7 +7660,7 @@ static bool vrend_patch_vertex_shader_interpolants(MAYBE_UNUSED const struct vre
    if (!vs_info || !fs_info)
       return true;
 
-   if (!fs_info->interpinfo)
+   if (!fs_info->num_interps)
       return true;
 
    if (fs_info->has_sample_input) {
@@ -7160,9 +7691,9 @@ static bool vrend_patch_vertex_shader_interpolants(MAYBE_UNUSED const struct vre
                replace_interp(prog_strings, "gl_BackColor", pstring, auxstring);
             }
          } else {
-            snprintf(glsl_name, 64, "ex_c%d", fs_info->interpinfo[i].semantic_index);
+            snprintf(glsl_name, 64, "%s_c%d", oprefix, fs_info->interpinfo[i].semantic_index);
             replace_interp(prog_strings, glsl_name, pstring, auxstring);
-            snprintf(glsl_name, 64, "ex_bc%d", fs_info->interpinfo[i].semantic_index);
+            snprintf(glsl_name, 64, "%s_bc%d",  oprefix, fs_info->interpinfo[i].semantic_index);
             replace_interp(prog_strings, glsl_name, pstring, auxstring);
          }
          break;
@@ -7175,10 +7706,6 @@ static bool vrend_patch_vertex_shader_interpolants(MAYBE_UNUSED const struct vre
          return false;
       }
    }
-
-   VREND_DEBUG(dbg_shader_glsl, rctx, "GLSL:");
-   VREND_DEBUG_EXT(dbg_shader_glsl, rctx, strarray_dump(prog_strings));
-   VREND_DEBUG(dbg_shader_glsl, rctx, "\n");
 
    return true;
 }
@@ -7193,7 +7720,6 @@ iter_vs_declaration(struct tgsi_iterate_context *iter,
    const char *shader_out_prefix = "tco";
    const char *name_prefix = "";
    unsigned i;
-   unsigned mask_temp;
 
    // Generate a shader that passes through all VS outputs
    if (decl->Declaration.File == TGSI_FILE_OUTPUT) {
@@ -7216,9 +7742,8 @@ iter_vs_declaration(struct tgsi_iterate_context *iter,
       ctx->inputs[i].layout_location = 0;
       ctx->inputs[i].last = decl->Range.Last;
       ctx->inputs[i].array_id = decl->Declaration.Array ? decl->Array.ArrayID : 0;
-      ctx->inputs[i].usage_mask  = mask_temp = decl->Declaration.UsageMask;
-      u_bit_scan_consecutive_range(&mask_temp, &ctx->inputs[i].swizzle_offset, &ctx->inputs[i].num_components);
-
+      ctx->inputs[i].usage_mask = decl->Declaration.UsageMask;
+      ctx->inputs[i].num_components = 4;      
       ctx->inputs[i].glsl_predefined_no_emit = false;
       ctx->inputs[i].glsl_no_index = false;
       ctx->inputs[i].override_no_wm = ctx->inputs[i].num_components == 1;
@@ -7254,6 +7779,7 @@ iter_vs_declaration(struct tgsi_iterate_context *iter,
 
       case TGSI_SEMANTIC_PATCH:
       case TGSI_SEMANTIC_GENERIC:
+      case TGSI_SEMANTIC_TESSCOORD:
          if (ctx->inputs[i].first != ctx->inputs[i].last ||
              ctx->inputs[i].array_id > 0) {
             ctx->guest_sent_io_arrays = true;
@@ -7274,7 +7800,6 @@ iter_vs_declaration(struct tgsi_iterate_context *iter,
          if (ctx->inputs[i].name == TGSI_SEMANTIC_FOG){
             ctx->inputs[i].usage_mask = 0xf;
             ctx->inputs[i].num_components = 4;
-            ctx->inputs[i].swizzle_offset = 0;
             ctx->inputs[i].override_no_wm = false;
             snprintf(ctx->inputs[i].glsl_name, 64, "%s_f%d", shader_in_prefix, ctx->inputs[i].sid);
             snprintf(ctx->outputs[i].glsl_name, 64, "%s_f%d", shader_out_prefix, ctx->inputs[i].sid);
@@ -7383,7 +7908,12 @@ bool vrend_shader_create_passthrough_tcs(const struct vrend_context *rctx,
    emit_buf(&ctx.glsl_strbufs, "}\n");
 
    fill_sinfo(&ctx, sinfo);
-   set_strbuffers(rctx, &ctx.glsl_strbufs, shader);
+   set_strbuffers(&ctx.glsl_strbufs, shader);
+
+   VREND_DEBUG(dbg_shader_glsl, rctx, "GLSL:");
+   VREND_DEBUG_EXT(dbg_shader_glsl, rctx, strarray_dump(shader));
+   VREND_DEBUG(dbg_shader_glsl, rctx, "\n");
+
    return true;
 fail:
    strbuf_free(&ctx.glsl_strbufs.glsl_main);
@@ -7394,18 +7924,74 @@ fail:
    return false;
 }
 
-bool vrend_shader_needs_alpha_func(const struct vrend_shader_key *key) {
-   if (!key->add_alpha_test)
-      return false;
-   switch (key->alpha_test) {
-   default:
-      return false;
-   case PIPE_FUNC_LESS:
-   case PIPE_FUNC_EQUAL:
-   case PIPE_FUNC_LEQUAL:
-   case PIPE_FUNC_GREATER:
-   case PIPE_FUNC_NOTEQUAL:
-   case PIPE_FUNC_GEQUAL:
-      return true;
+static
+void vrend_shader_write_io_as_src(struct vrend_strbuf *result,
+                                  const  char *array_or_varname,
+                                  const struct vrend_shader_io *io,
+                                  const struct tgsi_full_src_register *src,
+                                  enum io_decl_type decl_type)
+{
+
+
+   if (io->first == io->last) {
+      if (io->overlapping_array)
+         strbuf_appendf(result, "%s%s[%d]", io->overlapping_array->glsl_name,
+                        array_or_varname, io->array_offset);
+      else
+         strbuf_appendf(result, "%s%s", io->glsl_name, array_or_varname);
+
+   } else {
+      const struct vrend_shader_io *base = io->overlapping_array ? io->overlapping_array : io;
+      const int offset = src->Register.Index - io->first + io->array_offset;
+
+      if (decl_type == decl_block) {
+         if (src->Register.Indirect)
+            strbuf_appendf(result, "%s.%s[addr%d + %d]", array_or_varname, base->glsl_name,
+                           src->Indirect.Index, offset);
+         else
+            strbuf_appendf(result, "%s.%s[%d]", array_or_varname, base->glsl_name, offset);
+      } else {
+         if (src->Register.Indirect)
+            strbuf_appendf(result, "%s%s[addr%d + %d]", base->glsl_name,
+                           array_or_varname, src->Indirect.Index, offset);
+         else
+            strbuf_appendf(result, "%s%s[%d]", base->glsl_name,
+                           array_or_varname, offset);
+      }
+   }
+}
+
+static
+void vrend_shader_write_io_as_dst(struct vrend_strbuf *result,
+                                  const  char *array_or_varname,
+                                  const struct vrend_shader_io *io,
+                                  const struct tgsi_full_dst_register *src,
+                                  enum io_decl_type decl_type)
+{
+
+   if (io->first == io->last) {
+      if (io->overlapping_array)
+         strbuf_appendf(result, "%s%s[%d]", io->overlapping_array->glsl_name,
+                        array_or_varname, io->array_offset);
+      else
+         strbuf_appendf(result, "%s%s", io->glsl_name, array_or_varname);
+   } else {
+      const struct vrend_shader_io *base = io->overlapping_array ? io->overlapping_array : io;
+      const int offset = src->Register.Index - io->first + io->array_offset;
+
+      if (decl_type == decl_block) {
+         if (src->Register.Indirect)
+            strbuf_appendf(result, "%s.%s[addr%d + %d]", array_or_varname, base->glsl_name,
+                           src->Indirect.Index, offset);
+         else
+            strbuf_appendf(result, "%s.%s[%d]", array_or_varname, base->glsl_name, offset);
+      } else {
+         if (src->Register.Indirect)
+            strbuf_appendf(result, "%s%s[addr%d + %d]", base->glsl_name,
+                           array_or_varname, src->Indirect.Index, offset);
+         else
+            strbuf_appendf(result, "%s%s[%d]", base->glsl_name,
+                           array_or_varname, offset);
+      }
    }
 }

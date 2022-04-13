@@ -45,7 +45,7 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
-   void *renderer_data;
+   struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
 };
 
 struct virgl_context;
@@ -88,19 +88,17 @@ struct virgl_context {
    /* These are used to create a virgl_resource from a context object.
     *
     * get_blob returns a virgl_context_blob from which a virgl_resource can be
-    * created.  get_blob_done is optional and allows the context to associate
-    * the newly created resource with the context object.
+    * created.
     *
     * Note that get_blob is a one-time thing.  The context object might be
     * destroyed or reject subsequent get_blob calls.
     */
    int (*get_blob)(struct virgl_context *ctx,
+                   uint32_t res_id,
                    uint64_t blob_id,
+                   uint64_t blob_size,
                    uint32_t blob_flags,
                    struct virgl_context_blob *blob);
-   void (*get_blob_done)(struct virgl_context *ctx,
-                         uint32_t res_id,
-                         struct virgl_context_blob *blob);
 
    int (*submit_cmd)(struct virgl_context *ctx,
                      const void *buffer,

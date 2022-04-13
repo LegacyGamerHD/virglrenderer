@@ -343,6 +343,8 @@ enum virgl_formats {
    VIRGL_FORMAT_A8L8_SNORM              = 260,
    VIRGL_FORMAT_A8L8_SRGB               = 261,
 
+   VIRGL_FORMAT_A1B5G5R5_UNORM          = 262,
+
    VIRGL_FORMAT_X8B8G8R8_SNORM          = 268,
 
 
@@ -391,6 +393,12 @@ enum virgl_formats {
    VIRGL_FORMAT_A4B4G4R4_UNORM          = 311,
 
    VIRGL_FORMAT_R8_SRGB                 = 312,
+   VIRGL_FORMAT_R8G8_SRGB               = 313,
+
+   VIRGL_FORMAT_P010                    = 314,
+   VIRGL_FORMAT_P012                    = 315,
+   VIRGL_FORMAT_P016                    = 316,
+
    VIRGL_FORMAT_MAX /* = PIPE_FORMAT_COUNT */,
 
    /* Below formats must not be used in the guest. */
@@ -441,6 +449,9 @@ enum virgl_formats {
 #define VIRGL_CAP_V2_MEMINFO              (1 << 3)
 #define VIRGL_CAP_V2_STRING_MARKER        (1 << 4)
 #define VIRGL_CAP_V2_DIFFERENT_GPU        (1 << 5)
+#define VIRGL_CAP_V2_IMPLICIT_MSAA        (1 << 6)
+#define VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS (1 << 7)
+#define VIRGL_CAP_V2_SCANOUT_USES_GBM     (1 << 8)
 
 /* virgl bind flags - these are compatible with mesa 10.5 gallium.
  * but are fixed, no other should be passed to virgl either.
@@ -465,7 +476,7 @@ enum virgl_formats {
 #define VIRGL_BIND_STAGING       (1 << 19)
 #define VIRGL_BIND_SHARED        (1 << 20)
 
-#define VIRGL_BIND_PREFER_EMULATED_BGRA  (1 << 21)
+#define VIRGL_BIND_PREFER_EMULATED_BGRA  (1 << 21) /* non-functional */
 
 #define VIRGL_BIND_LINEAR (1 << 22)
 
@@ -594,6 +605,10 @@ struct virgl_caps_v2 {
         struct virgl_supported_format_mask scanout;
         uint32_t capability_bits_v2;
         uint32_t max_video_memory;
+        char renderer[64];
+        float max_anisotropy;
+        uint32_t max_texture_image_units;
+        struct virgl_supported_format_mask supported_multisample_formats;
 };
 
 union virgl_caps {
@@ -622,7 +637,8 @@ enum virgl_ctx_errors {
         VIRGL_ERROR_CTX_ILLEGAL_FORMAT,
         VIRGL_ERROR_CTX_ILLEGAL_SAMPLER_VIEW_TARGET,
         VIRGL_ERROR_CTX_TRANSFER_IOV_BOUNDS,
-        VIRGL_ERROR_CTX_ILLEGAL_DUAL_SRC_BLEND
+        VIRGL_ERROR_CTX_ILLEGAL_DUAL_SRC_BLEND,
+        VIRGL_ERROR_CTX_UNSUPPORTED_FUNCTION,
 };
 
 /**

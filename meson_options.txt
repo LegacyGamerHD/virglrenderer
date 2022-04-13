@@ -46,6 +46,28 @@ option(
 )
 
 option(
+  'venus-validate',
+  type : 'boolean',
+  value : 'false',
+  description : 'enable the validation layer for venus'
+)
+
+option(
+  'render-server',
+  type : 'boolean',
+  value : 'false',
+  description : 'enable support for render server'
+)
+
+option(
+  'render-server-worker',
+  type : 'combo',
+  value : 'process',
+  choices : ['process', 'thread', 'minijail'],
+  description : 'how a context in render server is serviced'
+)
+
+option(
   'tests',
   type : 'boolean',
   value : 'false',

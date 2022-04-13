@@ -31,12 +31,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "pipe/p_state.h"
 #include "util/u_format.h"
 #include "util/u_math.h"
+#include "vkr_allocator.h"
 #include "vkr_renderer.h"
 #include "vrend_renderer.h"
+#include "proxy/proxy_renderer.h"
 #include "vrend_winsys.h"
 
 #include "virglrenderer.h"
@@ -57,6 +60,8 @@ struct global_state {
    bool winsys_initialized;
    bool vrend_initialized;
    bool vkr_initialized;
+   bool proxy_initialized;
+   bool external_winsys_initialized;
 };
 
 static struct global_state state;
@@ -218,9 +223,12 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       ctx = vrend_renderer_context_create(ctx_id, nlen, name);
       break;
    case VIRGL_RENDERER_CAPSET_VENUS:
-      if (!state.vkr_initialized)
+      if (state.proxy_initialized)
+         ctx = proxy_context_create(ctx_id, ctx_flags, nlen, name);
+      else if (state.vkr_initialized)
+         ctx = vkr_context_create(nlen, name);
+      else
          return EINVAL;
-      ctx = vkr_context_create(nlen, name);
       break;
    default:
       return EINVAL;
@@ -551,6 +559,19 @@ static const struct vrend_if_cbs vrend_cbs = {
    make_current,
 };
 
+static int
+proxy_renderer_cb_get_server_fd(uint32_t version)
+{
+   if (state.cbs && state.cbs->version >= 3 && state.cbs->get_server_fd)
+      return state.cbs->get_server_fd(state.cookie, version);
+   else
+      return -1;
+}
+
+static const struct proxy_renderer_cbs proxy_cbs = {
+   proxy_renderer_cb_get_server_fd,
+};
+
 void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height)
 {
    struct virgl_resource *res = virgl_resource_lookup(resource_id);
@@ -567,7 +588,7 @@ void virgl_renderer_poll(void)
 {
    TRACE_FUNC();
    if (state.vrend_initialized)
-      vrend_renderer_check_fences();
+      vrend_renderer_poll();
 }
 
 void virgl_renderer_cleanup(UNUSED void *cookie)
@@ -582,13 +603,19 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    if (state.resource_initialized)
       virgl_resource_table_cleanup();
 
-   if (state.vkr_initialized)
+   if (state.proxy_initialized)
+      proxy_renderer_fini();
+
+   if (state.vkr_initialized) {
       vkr_renderer_fini();
+      /* vkr_allocator_init is called on-demand upon the first map */
+      vkr_allocator_fini();
+   }
 
    if (state.vrend_initialized)
       vrend_renderer_fini();
 
-   if (state.winsys_initialized)
+   if (state.winsys_initialized || state.external_winsys_initialized)
       vrend_winsys_cleanup();
 
    memset(&state, 0, sizeof(state));
@@ -659,6 +686,27 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
       state.winsys_initialized = true;
    }
 
+   if (!state.winsys_initialized && !state.external_winsys_initialized &&
+       state.cbs && state.cbs->version >= 4 && state.cbs->get_egl_display) {
+      void *egl_display = NULL;
+
+      if (!cbs->create_gl_context || !cbs->destroy_gl_context ||
+          !cbs->make_current)
+         goto fail;
+
+      egl_display = state.cbs->get_egl_display(cookie);
+
+      if (!egl_display)
+         goto fail;
+
+      ret = vrend_winsys_init_external(egl_display);
+
+      if (ret)
+         goto fail;
+
+      state.external_winsys_initialized = true;
+   }
+
    if (!state.vrend_initialized && !(flags & VIRGL_RENDERER_NO_VIRGL)) {
       uint32_t renderer_flags = 0;
 
@@ -669,6 +717,8 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
 
       if (flags & VIRGL_RENDERER_THREAD_SYNC)
          renderer_flags |= VREND_USE_THREAD_SYNC;
+      if (flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
+         renderer_flags |= VREND_USE_ASYNC_FENCE_CB;
       if (flags & VIRGL_RENDERER_USE_EXTERNAL_BLOB)
          renderer_flags |= VREND_USE_EXTERNAL_BLOB;
 
@@ -682,11 +732,22 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
       uint32_t vkr_flags = 0;
       if (flags & VIRGL_RENDERER_THREAD_SYNC)
          vkr_flags |= VKR_RENDERER_THREAD_SYNC;
+      if (flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
+         vkr_flags |= VKR_RENDERER_ASYNC_FENCE_CB;
+      if (flags & VIRGL_RENDERER_RENDER_SERVER)
+         vkr_flags |= VKR_RENDERER_RENDER_SERVER;
 
-      int ret = vkr_renderer_init(vkr_flags);
+      ret = vkr_renderer_init(vkr_flags);
       if (ret)
          goto fail;
       state.vkr_initialized = true;
+   }
+
+   if (!state.proxy_initialized && (flags & VIRGL_RENDERER_RENDER_SERVER)) {
+      ret = proxy_renderer_init(&proxy_cbs, flags | VIRGL_RENDERER_NO_VIRGL);
+      if (ret)
+         goto fail;
+      state.proxy_initialized = true;
    }
 
    return 0;
@@ -724,6 +785,9 @@ void virgl_renderer_reset(void)
    if (state.resource_initialized)
       virgl_resource_table_reset();
 
+   if (state.proxy_initialized)
+      proxy_renderer_reset();
+
    if (state.vkr_initialized)
       vkr_renderer_reset();
 
@@ -742,7 +806,7 @@ int virgl_renderer_get_poll_fd(void)
 
 virgl_debug_callback_type virgl_set_debug_callback(virgl_debug_callback_type cb)
 {
-   return vrend_set_debug_callback(cb);
+   return virgl_log_set_logger(cb);
 }
 
 static int virgl_renderer_export_query(void *execute_args, uint32_t execute_size)
@@ -848,6 +912,10 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    if (args->res_handle == 0)
       return -EINVAL;
 
+   /* user resource id must be unique */
+   if (virgl_resource_lookup(args->res_handle))
+      return -EINVAL;
+
    if (args->size == 0)
       return -EINVAL;
    if (has_guest_storage) {
@@ -874,7 +942,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    if (!ctx)
       return -EINVAL;
 
-   ret = ctx->get_blob(ctx, args->blob_id, args->blob_flags, &blob);
+   ret = ctx->get_blob(ctx, args->res_handle, args->blob_id, args->size, args->blob_flags, &blob);
    if (ret)
       return ret;
 
@@ -883,7 +951,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
                                           blob.type,
                                           blob.u.fd,
                                           args->iovecs,
-                                          args->num_iovs);
+                                          args->num_iovs,
+                                          &blob.opaque_fd_metadata);
       if (!res) {
          close(blob.u.fd);
          return -ENOMEM;
@@ -900,31 +969,76 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    }
 
    res->map_info = blob.map_info;
-
-   if (ctx->get_blob_done)
-      ctx->get_blob_done(ctx, args->res_handle, &blob);
+   res->map_size = args->size;
 
    return 0;
 }
 
-int virgl_renderer_resource_map(uint32_t res_handle, void **map, uint64_t *out_size)
+int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
 {
    TRACE_FUNC();
+   int ret = 0;
+   void *map = NULL;
+   uint64_t map_size = 0;
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   if (!res || !res->pipe_resource)
+   if (!res || res->mapped)
       return -EINVAL;
 
-   return vrend_renderer_resource_map(res->pipe_resource, map, out_size);
+   if (res->pipe_resource) {
+      ret = vrend_renderer_resource_map(res->pipe_resource, &map, &map_size);
+      if (!ret)
+         res->map_size = map_size;
+   } else {
+      switch (res->fd_type) {
+      case VIRGL_RESOURCE_FD_DMABUF:
+      case VIRGL_RESOURCE_FD_SHM:
+         map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, res->fd, 0);
+         map_size = res->map_size;
+         break;
+      case VIRGL_RESOURCE_FD_OPAQUE:
+         ret = vkr_allocator_resource_map(res, &map, &map_size);
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (!map || map == MAP_FAILED)
+      return -EINVAL;
+
+   res->mapped = map;
+   *out_map = map;
+   *out_size = map_size;
+   return ret;
 }
 
 int virgl_renderer_resource_unmap(uint32_t res_handle)
 {
    TRACE_FUNC();
+   int ret;
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   if (!res || !res->pipe_resource)
+   if (!res || !res->mapped)
       return -EINVAL;
 
-   return vrend_renderer_resource_unmap(res->pipe_resource);
+   if (res->pipe_resource) {
+      ret = vrend_renderer_resource_unmap(res->pipe_resource);
+   } else {
+      switch (res->fd_type) {
+      case VIRGL_RESOURCE_FD_DMABUF:
+         ret = munmap(res->mapped, res->map_size);
+         break;
+      case VIRGL_RESOURCE_FD_OPAQUE:
+         ret = vkr_allocator_resource_unmap(res);
+         break;
+      default:
+         ret = -EINVAL;
+         break;
+      }
+   }
+
+   assert(!ret);
+   res->mapped = NULL;
+   return ret;
 }
 
 int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint32_t *map_info)
@@ -956,9 +1070,69 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
    case VIRGL_RESOURCE_FD_OPAQUE:
       *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE;
       break;
+   case VIRGL_RESOURCE_FD_SHM:
+      *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_SHM;
+      break;
    default:
       return EINVAL;
    }
+
+   return 0;
+}
+
+int
+virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_blob_args *args)
+{
+   TRACE_FUNC();
+   struct virgl_resource *res;
+
+   /* user resource id must be greater than 0 */
+   if (args->res_handle == 0)
+      return -EINVAL;
+
+   /* user resource id must be unique */
+   if (virgl_resource_lookup(args->res_handle))
+      return -EINVAL;
+
+   switch (args->blob_mem) {
+   case VIRGL_RENDERER_BLOB_MEM_HOST3D:
+   case VIRGL_RENDERER_BLOB_MEM_GUEST_VRAM:
+      break;
+   default:
+      return -EINVAL;
+   }
+
+   enum virgl_resource_fd_type fd_type = VIRGL_RESOURCE_FD_INVALID;
+   switch (args->fd_type) {
+   case VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF:
+      fd_type = VIRGL_RESOURCE_FD_DMABUF;
+      break;
+   case VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE:
+      fd_type = VIRGL_RESOURCE_FD_OPAQUE;
+      break;
+   case VIRGL_RENDERER_BLOB_FD_TYPE_SHM:
+      fd_type = VIRGL_RESOURCE_FD_SHM;
+      break;
+   default:
+      return -EINVAL;
+   }
+
+   if (args->fd < 0)
+      return -EINVAL;
+   if (args->size == 0)
+      return -EINVAL;
+
+   res = virgl_resource_create_from_fd(args->res_handle,
+                                       fd_type,
+                                       args->fd,
+                                       NULL,
+                                       0,
+                                       NULL);
+   if (!res)
+      return -ENOMEM;
+
+   res->map_info = 0;
+   res->map_size = args->size;
 
    return 0;
 }

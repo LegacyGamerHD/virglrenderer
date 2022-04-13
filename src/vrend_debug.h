@@ -26,6 +26,7 @@
 #define vrend_debug_h
 
 #include "virgl_protocol.h"
+#include "virgl_util.h"
 #include <stdarg.h>
 
 struct vrend_context;
@@ -46,7 +47,8 @@ enum virgl_debug_flags {
    dbg_tweak =  1 << 10,
    dbg_query =  1 << 11,
    dbg_gles =  1 << 12,
-   dbg_all = (1 << 13) - 1,
+   dbg_bgra = 1 << 13,
+   dbg_all = (1 << 14) - 1,
    dbg_allow_guest_override = 1 << 16,
    dbg_feature_use = 1 << 17,
    dbg_khr = 1 << 18,
@@ -69,37 +71,38 @@ unsigned vrend_debug(const struct vrend_context *ctx, enum virgl_debug_flags fla
 
 void vrend_debug_add_flag(enum virgl_debug_flags flag);
 
-void vrend_printf(const char *fmt, ...);
+static inline void vrend_printf(const char *fmt, ...)
+{
+   va_list va;
+   va_start(va, fmt);
+   virgl_logv(fmt, va);
+   va_end(va);
+}
 
-typedef void (*virgl_debug_callback_type)(const char *fmt, va_list ap);
+#ifdef NDEBUG
+#define VREND_DEBUG_ENABLED (false)
+#else
+#define VREND_DEBUG_ENABLED (true)
+#endif
 
-virgl_debug_callback_type vrend_set_debug_callback(virgl_debug_callback_type cb);
-
-#ifndef NDEBUG
 #define VREND_DEBUG(flag, ctx,  ...) \
-   if (vrend_debug(ctx, flag)) \
+   if (VREND_DEBUG_ENABLED && vrend_debug(ctx, flag)) \
       do { \
             vrend_print_context_name(ctx); \
             vrend_printf(__VA_ARGS__); \
       } while (0)
 
 #define VREND_DEBUG_EXT(flag, ctx, X) \
-   if (vrend_debug(ctx, flag)) \
+   if (VREND_DEBUG_ENABLED && vrend_debug(ctx, flag)) \
       do { \
             vrend_print_context_name(ctx); \
             X; \
       } while (0)
 
 #define VREND_DEBUG_NOCTX(flag, ctx, ...) \
-   if (vrend_debug(ctx, flag)) \
+   if (VREND_DEBUG_ENABLED && vrend_debug(ctx, flag)) \
       do { \
             vrend_printf(__VA_ARGS__); \
       } while (0)
-
-#else
-#define VREND_DEBUG(flag, ctx, ...) (void)ctx
-#define VREND_DEBUG_EXT(flag, ctx, X) (void)ctx
-#define VREND_DEBUG_NOCTX(flag, ctx, ...) (void)ctx
-#endif
 
 #endif

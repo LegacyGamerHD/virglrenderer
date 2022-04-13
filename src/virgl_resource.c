@@ -30,6 +30,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "util/os_file.h"
 #include "util/u_hash_table.h"
 #include "util/u_pointer.h"
 #include "virgl_util.h"
@@ -129,7 +130,8 @@ virgl_resource_create_from_fd(uint32_t res_id,
                               enum virgl_resource_fd_type fd_type,
                               int fd,
                               const struct iovec *iov,
-                              int iov_count)
+                              int iov_count,
+                              const struct virgl_resource_opaque_fd_metadata *opaque_fd_metadata)
 {
    struct virgl_resource *res;
 
@@ -145,6 +147,9 @@ virgl_resource_create_from_fd(uint32_t res_id,
 
    res->iov = iov;
    res->iov_count = iov_count;
+
+   if (opaque_fd_metadata && fd_type == VIRGL_RESOURCE_FD_OPAQUE)
+      res->opaque_fd_metadata = *opaque_fd_metadata;
 
    return res;
 }
@@ -219,13 +224,7 @@ enum virgl_resource_fd_type
 virgl_resource_export_fd(struct virgl_resource *res, int *fd)
 {
    if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
-#ifdef F_DUPFD_CLOEXEC
-      *fd = fcntl(res->fd, F_DUPFD_CLOEXEC, 0);
-      if (*fd < 0)
-         *fd = dup(res->fd);
-#else
-      *fd = dup(res->fd);
-#endif
+      *fd = os_dupfd_cloexec(res->fd);
       return *fd >= 0 ? res->fd_type : VIRGL_RESOURCE_FD_INVALID;
    } else if (res->pipe_resource) {
       return pipe_callbacks.export_fd(res->pipe_resource,
@@ -234,4 +233,16 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
    }
 
    return VIRGL_RESOURCE_FD_INVALID;
+}
+
+uint64_t
+virgl_resource_get_size(struct virgl_resource *res)
+{
+   if (res->map_size)
+      return res->map_size;
+
+   if (res->pipe_resource)
+      return pipe_callbacks.get_size(res->pipe_resource, pipe_callbacks.data);
+
+   return 0;
 }
